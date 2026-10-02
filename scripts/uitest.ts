@@ -77,7 +77,7 @@ console.log('  openDlg   :', await evalJs('typeof openDlg'));
 console.log('  登录墙隐藏:', await evalJs('getComputedStyle(document.querySelector(".gate")).display'));
 
 // 逐个 tab 遍历，看有没有渲染时抛异常
-const tabs = ['overview', 'persons', 'memory', 'channels', 'models', 'roles', 'tools', 'logs', 'search', 'runtime', 'tasks', 'scheduled'];
+const tabs = ['overview', 'persons', 'memory', 'channels', 'models', 'mcp', 'roles', 'tools', 'logs', 'search', 'runtime', 'tasks', 'scheduled', 'chat', 'personas'];
 console.log('\n=== 逐页切换 ===');
 for (const t of tabs) {
   const before = errors.length;
