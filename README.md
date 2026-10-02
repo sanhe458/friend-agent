@@ -13,29 +13,40 @@ node src/index.ts          # 跑一遍演示（M0/M1 全链路）
 node src/index.ts --cli    # 起本地 CLI 通道，手动聊天
 ```
 
-## 已完成（M0 + M1）
+## 已完成
 
-| 模块 | 状态 |
+| 模块 | 说明 |
 | --- | --- |
-| `core/types.ts` | 领域类型：Person / Binding / Inbound / Outbound / Capabilities |
-| `core/person.ts` | 身份解析 + 跨通道合并（验证必须在已知通道内完成） |
-| `core/queue.ts` | per-person 串行队列 + **插话槽**（工具间隙消费） |
-| `core/bus.ts` | 事件总线 |
-| `memory/store.ts` | 内存版 person 分片记忆（recall 关键词打分） |
-| `tools/registry.ts` | 工具注册表 + 超时中止（超时不预设话术） |
-| `tools/builtin.ts` | time / search(桩) / memory_recall / memory_remember / delegate / task_status / list_tasks |
-| `orchestrator/orchestrator.ts` | 任务分发 + 进度事件 + 假 subagent |
-| `adapters/` | Adapter 接口 + MockAdapter + CliAdapter |
-| `reply/engine.ts` | 前台回复引擎（**规则桩**，未接模型） |
+| `core/` | 类型、身份归并（验证码跨通道证明 + 尝试次数上限）、串行队列 + 插话槽、事件总线、**命令系统**（`/` 开头不进回复引擎）、定时调度（并发触发 + 心跳式防重） |
+| `memory/store.ts` | person 分片记忆（recall 关键词打分） |
+| `models/` | 模型注册表（角色：reply / main / sub / **asr**，类型校验分开）、客户端（流式 + 截断标记 + 按错误类型降级）、**元数据取真源**（服务商端点 → models.dev 目录） |
+| `tools/` | 注册表（audience 标记 + 动态摘挂）、内置工具、**真浏览器**（无头 Chromium，CDP：打开/取文/点击/截图） |
+| `mcp/client.ts` | **MCP 客户端**：stdio JSON-RPC 握手、工具挂载（`mcp_服务器_` 前缀）、audience 勾选（回复模型/子agent/都勾）、生命周期闭环（不漏孤儿进程） |
+| `reply/engine.ts` | 前台回复引擎：真模型 + 工具循环（5 轮）+ 插话注入 + 上下文压缩 + 失败不入历史 |
+| `orchestrator/` | 任务分发 + 专员（浏览器/深搜/长任务，pi 与本地双 harness）+ 进度事件 |
+| `adapters/` | QQ（WebSocket 网关 + 心跳 ACK 监控 + 45s 就绪超时 + 流式私聊）、Telegram（长轮询 + 429 重试）、CLI/Mock |
+| `store/persist.ts` | SQLite：persons/bindings/memories/history/events/tasks/jobs，**自动修剪** + 绑定先删后插（合并重启不回滚） |
+| `panel/` | Web 控制台（8918）：概览/对话/任务/定时/身份/记忆/通道/模型/**MCP**/角色/人格/日志/搜索/运行时 |
+| 运维 | systemd 自启动（崩溃自愈实测）+ GitHub 自动推送（path 单元监听） |
+
+## 已验证的关键行为
+
+- 身份合并 → 关库 → 重开：仍是同一人（合并重启不回滚）
+- 跨通道验证码：码发已知对话，必须回到发起对话回码；错 6 次作废
+- MCP：真实 JSON-RPC 往返（echo/add）、audience 双向过滤、重启自动挂载、退出无孤儿
+- 真浏览器：JS 渲染（curl 拿不到的内容）、真实鼠标点击跳转、截图落盘
+- 面板回归：14 页 0 异常
+
 
 ## 待办
 
-- **M2** 身份：验证码通道化（真正经适配器发/收验证码，而不是直接调 API）
-- **M3** 前台：接快模型（替换 `reply/engine.ts` 的规则分支）+ 真搜索 + 自动召回接模型
-- **M4** subagent：真任务执行（子进程 / 独立模型），结果回注走 bus
-- **M5** 韧性：流式回复、并发压测、任务超时与失败重试
-- 通道：接真 Telegram / QQ 适配器
-- 存储：内存版 → SQLite
+- **语音**：TTS 回复（ASR 已通，反向还没有）
+- **MCP**：SSE/HTTP 传输（现在只有 stdio）；工具调用审计面板
+- **浏览器**：登录态保持（cookie 持久化）、并行多标签
+- **韧性**：子 agent 失败重试、限流熔断
+- **记忆**：长期提炼的定期任务化（现在靠 main 角色被动触发）
+- **面板**：MCP 工具逐个启停粒度（现在是整台服务器级）
+
 
 ## 关键设计（写死在代码里的约束）
 
