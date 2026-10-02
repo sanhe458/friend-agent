@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>friend-agent · 控制台</title>
+<link rel="stylesheet" href="/panel/app.css">
+</head>
+<body>
+
+<div class="gate" id="gate">
+  <div class="box">
+    <h3 style="font-size:15px;margin-bottom:6px">friend-agent 控制台</h3>
+    <p style="color:var(--ink3);font-size:12.5px;margin-bottom:14px">需要访问令牌（面板启动日志里可见）</p>
+    <input id="gate-input" type="password" placeholder="粘贴令牌" style="margin-bottom:12px">
+    <button class="btn pri" id="gate-btn" style="width:100%">进入</button>
+  </div>
+</div>
+
+<div class="shell">
+  <aside class="side">
+    <div class="brand">
+      <b>friend-agent</b>
+      <small>朋友型 Agent 运行时</small>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="sidefoot">
+      <div class="row"><span>进程</span><span class="mono" id="sf-pid">—</span></div>
+      <div class="row"><span>运行</span><span class="mono num" id="sf-up">—</span></div>
+      <div class="row"><span>状态</span><span id="sf-dot"><i class="dot"></i> —</span></div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="top">
+      <button class="hamb" id="hamb" aria-label="打开菜单">☰</button>
+      <h1 id="ttl">概览</h1>
+      <span class="sub" id="tsub"></span>
+      <div class="right" id="tacts"></div>
+    </header>
+    <div class="body" id="body"><div class="wrap" id="view"></div></div>
+  </div>
+</div>
+
+<div class="sback" id="sback"></div>
+<div class="mask" id="mask"><div class="dlg">
+  <header id="dlg-t">编辑</header>
+  <div class="bd" id="dlg-b"></div>
+  <footer id="dlg-f"></footer>
+</div></div>
+<div class="toast" id="toast"></div>
+<div class="jserr" id="jserr"></div>
+
+<script src="/panel/shell.js"></script>
+<script src="/panel/pages/overview.js"></script>
+<script src="/panel/pages/runtime.js"></script>
+<script src="/panel/pages/tasks.js"></script>
+<script src="/panel/pages/persons.js"></script>
+<script src="/panel/pages/memory.js"></script>
+<script src="/panel/pages/channels.js"></script>
+<script src="/panel/pages/models.js"></script>
+<script src="/panel/pages/roles.js"></script>
+<script src="/panel/pages/tools.js"></script>
+<script src="/panel/pages/logs.js"></script>
+<script src="/panel/pages/search.js"></script>
+<script src="/panel/pages/chat.js"></script>
+<script src="/panel/pages/scheduled.js"></script>
+<script src="/panel/pages/personas.js"></script>
+<script src="/panel/boot.js"></script>
+</body>
+</html>

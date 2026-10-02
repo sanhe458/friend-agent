@@ -1,0 +1,14 @@
+# 密钥与本地配置（0600，含 apiKey / panelToken / metasoKey）
+config.local.json
+*.local.json
+
+# 运行数据（SQLite / 子 agent 工作区）
+data/
+
+# 日志与临时产物
+*.log
+shots/
+/tmp/
+
+# node
+node_modules/
