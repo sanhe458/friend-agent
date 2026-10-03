@@ -35,7 +35,12 @@ function resolveCommand(command: string): string {
 
 export interface McpServerConfig {
   id: string;
+  /** stdio：可执行命令；**HTTP 传输：直接填 https://… 的 URL**（两种都收，2026-10-03） */
   command: string;
+  /** 也可显式给 URL（等价于 command 填 URL） */
+  url?: string;
+  /** HTTP 传输的额外请求头（远程服务器常需要鉴权，如 Authorization） */
+  headers?: Record<string, string>;
   args?: string[];
   env?: Record<string, string>;
   cwd?: string;
@@ -51,6 +56,24 @@ const PROTOCOL_VERSION = '2025-06-18';
 /** JSON-RPC 消息类型 */
 type RpcMsg = { jsonrpc: '2.0'; id?: number | string; method?: string; result?: unknown; error?: { code: number; message: string } };
 
+/** command 填的是不是 URL（是 → HTTP 传输，不再拉子进程） */
+const isHttpUrl = (s: string) => /^https?:\/\//i.test(s);
+
+/** 从 SSE 文本里抠出全部 JSON-RPC 消息（event: message / data: {...}） */
+function sseMessages(body: string): RpcMsg[] {
+  const out: RpcMsg[] = [];
+  for (const chunk of body.split('\n\n')) {
+    for (const line of chunk.split('\n')) {
+      const s = line.trim();
+      if (!s.startsWith('data:')) continue;
+      const payload = s.slice(5).trim();
+      if (!payload || payload === '[DONE]') continue;
+      try { out.push(JSON.parse(payload) as RpcMsg); } catch { /* 非 JSON 行忽略 */ }
+    }
+  }
+  return out;
+}
+
 class McpConnection {
   #proc: ReturnType<typeof spawn> | null = null;
   #waits = new Map<number, (m: RpcMsg) => void>();
@@ -62,18 +85,46 @@ class McpConnection {
   readonly id: string;
   readonly cfg: McpServerConfig;
   lastError = '';
+  /** 传输方式：command/url 是 URL → 'http'（Streamable HTTP），否则 stdio 子进程 */
+  readonly mode: 'stdio' | 'http';
+  #url?: string;
+  #sessionId?: string;
+  #httpUp = false;
 
   constructor(cfg: McpServerConfig) {
     this.cfg = cfg;
     this.id = cfg.id;
+    this.#url = cfg.url ?? (isHttpUrl(cfg.command) ? cfg.command : undefined);
+    this.mode = this.#url ? 'http' : 'stdio';
   }
 
-  get connected(): boolean { return this.#proc !== null && this.#proc.exitCode === null; }
+  get connected(): boolean {
+    if (this.mode === 'http') return this.#httpUp;
+    return this.#proc !== null && this.#proc.exitCode === null;
+  }
 
   async start(): Promise<void> {
     if (this.connected) return;
     this.#waits.clear();
     this.#buf = '';
+
+    // ── HTTP（Streamable HTTP / MCP-over-HTTP）──
+    if (this.mode === 'http') {
+      const init = await this.#httpRpc('initialize', {
+        protocolVersion: PROTOCOL_VERSION,
+        capabilities: {},
+        clientInfo: { name: 'friend-agent', version: '1.0.0' },
+      }, 15_000);
+      if (!init || (init as any).error) {
+        throw new Error(`initialize 失败：${(init as any)?.error?.message ?? '无响应'}`);
+      }
+      this.#httpUp = true;
+      // initialized 通知：202 也算成功，失败不回滚（有的服务器不回 202）
+      void this.#notify('notifications/initialized');
+      return;
+    }
+
+    // ── stdio（原路径）──
     const proc = spawn(resolveCommand(this.cfg.command), this.cfg.args ?? [], {
       cwd: this.cfg.cwd ?? undefined,
       env: { ...process.env, ...(this.cfg.env ?? {}) },
@@ -133,6 +184,7 @@ class McpConnection {
   }
 
   #request(method: string, params: unknown, timeoutMs: number): Promise<RpcMsg> {
+    if (this.mode === 'http') return this.#httpRpc(method, params, timeoutMs);
     const id = ++this.#seq;
     return new Promise((resolve) => {
       this.#waits.set(id, resolve);
@@ -148,7 +200,71 @@ class McpConnection {
   }
 
   #notify(method: string, params?: unknown): void {
+    if (this.mode === 'http') {
+      // 通知不需要回应：发出去就行（失败也无所谓，下次请求会暴露）
+      void this.#httpPost({ jsonrpc: '2.0', method, params } as unknown).catch(() => {});
+      return;
+    }
     this.#write({ jsonrpc: '2.0', method, params });
+  }
+
+  /** HTTP POST 一条 JSON-RPC 消息；返回解析出的全部消息（单 JSON 或 SSE 流） */
+  async #httpPost(msg: unknown): Promise<RpcMsg[]> {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream',
+      ...(this.#sessionId ? { 'Mcp-Session-Id': this.#sessionId } : {}),
+      ...(this.cfg.headers ?? {}),
+    };
+    const res = await fetch(this.#url!, {
+      method: 'POST', headers, body: JSON.stringify(msg),
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (res.status === 202) return []; // 通知被接受，无响应体
+    const ct = res.headers.get('content-type') ?? '';
+    const body = await res.text();
+    if (ct.includes('text/event-stream')) return sseMessages(body);
+    try { return [JSON.parse(body) as RpcMsg]; } catch { return []; }
+  }
+
+  /** HTTP 上的一次请求-响应（Streamable HTTP：POST 进去，响应可能在同一连接的 SSE 流里回来） */
+  async #httpRpc(method: string, params: unknown, timeoutMs: number): Promise<RpcMsg> {
+    const id = ++this.#seq;
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        ...(this.#sessionId ? { 'Mcp-Session-Id': this.#sessionId } : {}),
+        ...(this.cfg.headers ?? {}),
+      };
+      const res = await fetch(this.#url!, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      // initialize 时记下会话 id，后续请求都带上（Streamable HTTP 的会话语义）
+      if (method === 'initialize') {
+        const sid = res.headers.get('mcp-session-id');
+        if (sid) this.#sessionId = sid;
+      }
+      if (res.status === 202) return { jsonrpc: '2.0', id, result: {} };
+      if (!res.ok) {
+        const t = await res.text().catch(() => '');
+        if (res.status === 404) { this.#sessionId = undefined; this.#httpUp = false; } // 会话失效，下次重连
+        return { jsonrpc: '2.0', error: { code: -4, message: `HTTP ${res.status} ${t.slice(0, 160)}` } };
+      }
+      const ct = res.headers.get('content-type') ?? '';
+      const body = await res.text();
+      const msgs = ct.includes('text/event-stream') ? sseMessages(body)
+        : (() => { try { return [JSON.parse(body) as RpcMsg]; } catch { return []; } })();
+      for (const m of msgs) if (m.method) this.#onMsg(m); // 捎带的记进通知环
+      const mine = msgs.find((m) => String(m.id) === String(id));
+      return mine ?? { jsonrpc: '2.0', error: { code: -5, message: '响应里没有匹配的 id' } };
+    } catch (err) {
+      this.#httpUp = false;
+      return { jsonrpc: '2.0', error: { code: -6, message: `HTTP 请求失败：${(err as Error).message}` } };
+    }
   }
 
   #write(obj: unknown): void {
@@ -179,6 +295,16 @@ class McpConnection {
   }
 
   stop(): void {
+    if (this.mode === 'http') {
+      // 优雅关闭：Streamable HTTP 用 DELETE 结束会话（尽力而为）
+      if (this.#sessionId && this.#url) {
+        const headers = { ...(this.#sessionId ? { 'Mcp-Session-Id': this.#sessionId } : {}), ...(this.cfg.headers ?? {}) };
+        void fetch(this.#url, { method: 'DELETE', headers, signal: AbortSignal.timeout(5000) }).catch(() => {});
+      }
+      this.#httpUp = false;
+      this.#sessionId = undefined;
+      return;
+    }
     try { this.#proc?.kill(); } catch { /* ignore */ }
     this.#proc = null;
     for (const w of this.#waits.values()) w({ jsonrpc: '2.0', error: { code: -1, message: '已关闭' } });
