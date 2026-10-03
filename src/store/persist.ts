@@ -177,14 +177,14 @@ export function createSqlitePersistence(file: string): Persistence {
     // 修剪：每张表只保留每人最近 N 条。**以前只 INSERT 从不 DELETE** ——
     // 内存里有上限，数据库没有；跑几个月 events（每个工具调用一条）会堆到几十万行。
     //
-    // ⚠️ 子查询取的是「倒数第 limit 条」的 id，删除条件必须是 `id < 它`
-    //    （删掉比它更早的），这样正好保留最后 limit 条。
-    //    旧写法用的是 `id <= 它`，等于把保留数少算了 1 条。
+    // 修剪语义：保留最近 KEEP 条。子查询取「倒数第 KEEP 条」的 id，
+    // 删除条件用 `id <= 它`（把那一条也删掉）→ 正好剩 KEEP 条。
+    // ⚠️ 2026-10-03 复核：62002b7 把它改成 `id <`，实测稳定剩 KEEP+1 条（off-by-one 反向了），已改回。
     pruneHist: db.prepare(
-      'delete from history where person_id = ? and id < (select id from history where person_id = ? order by id desc limit 1 offset ?)',
+      'delete from history where person_id = ? and id <= (select id from history where person_id = ? order by id desc limit 1 offset ?)',
     ),
     pruneEvts: db.prepare(
-      'delete from events where person_id = ? and id < (select id from events where person_id = ? order by id desc limit 1 offset ?)',
+      'delete from events where person_id = ? and id <= (select id from events where person_id = ? order by id desc limit 1 offset ?)',
     ),
     allPersons: db.prepare('select id, display_name, preferred_channel, persona_id, created_at from persons'),
     allBindings: db.prepare('select channel, external_id, person_id, verified_at, display_name from bindings'),
