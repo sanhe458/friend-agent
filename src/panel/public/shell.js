@@ -125,6 +125,7 @@ const ICO = {
   roles: '<path d="M4 8h9M19 8h1M4 16h3M13 16h7"/><circle cx="16" cy="8" r="2.2"/><circle cx="10" cy="16" r="2.2"/>',
   personas: '<path d="M4.5 5.5h15v5.5a7.5 7.5 0 0 1-15 0z"/><path d="M9 10.5h.02M15 10.5h.02"/>',
   tools: '<path d="M15.5 4a4.5 4.5 0 0 0-3.9 6.7L4 18.3 5.7 20l7.6-7.6A4.5 4.5 0 0 0 20 8.5l-3 3-2.5-2.5 3-3A4.5 4.5 0 0 0 15.5 4z"/>',
+  mcp: '<rect x="3.5" y="9.5" width="7" height="5" rx="2.5"/><rect x="13.5" y="9.5" width="7" height="5" rx="2.5"/><path d="M10.5 12h3"/>',
   logs: '<path d="M6 3.5h8l4.5 4.5v12.5H6z"/><path d="M14 3.5V8h4.5"/><path d="M9 12h6M9 15.5h6"/>',
   search: '<circle cx="11" cy="11" r="6.5"/><path d="M16 16l4 4"/>',
   runtime: '<path d="M3.5 12h4l2.5-6 4 12 2.5-6h4"/>',
@@ -165,7 +166,8 @@ const TITLES = {
   tools: ['工具白名单', '前台与子 agent 可用的工具'], logs: ['日志', '与各通道的收发记录'],
   search: ['搜索', '秘塔联网检索'], runtime: ['运行时', '热重载与进程重启'],
   scheduled: ['定时任务', '到点主动找他说话'],
-  personas: ['人格预设', '一个 agent，多套人格，按对话切换']
+  personas: ['人格预设', '一个 agent，多套人格，按对话切换'],
+  mcp: ['MCP', '外部工具挂载与「给谁用」勾选']
 };
 function renderNav() {
   const n = $('#nav');
