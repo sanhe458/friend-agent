@@ -112,7 +112,12 @@ function modelDialog(provs, existing) {
     '<label class="f"><span>ID（唯一键' + (editing ? '，不可改' : '；角色引用它') + '）</span>' +
       '<input id="m-id" value="' + esc(m.id || '') + '"' + (editing ? ' readonly' : '') + ' placeholder="fast"></label>' +
     '<label class="f"><span>服务商</span><select id="m-prov">' +
-      provs.map((p) => '<option value="' + esc(p.id) + '"' + (m.providerId === p.id ? ' selected' : '') + '>' + esc(p.id) + '</option>').join('') +
+      provs.map((p, i) => {
+        // 未命中任何服务商时（老数据 providerId 为空或已删）默认选第一个，
+        // 否则浏览器默认选第一个但用户毫无察觉，保存会静默改错服务商。
+        const sel = m.providerId ? m.providerId === p.id : i === 0;
+        return '<option value="' + esc(p.id) + '"' + (sel ? ' selected' : '') + '>' + esc(p.id) + '</option>';
+      }).join('') +
     '</select></label>' +
     '<label class="f"><span>真实模型名（发给 API 的那个）</span><input id="m-model" value="' + esc(m.model || '') + '" placeholder="deepseek-chat"></label>' +
     '<label class="f"><span>类型</span><select id="m-kind">' +
@@ -140,7 +145,14 @@ function modelDialog(provs, existing) {
       const model = $('#m-model').value.trim();
       if (!id) { toast('✗ 请填 ID'); return false; }
       if (!model) { toast('✗ 请填真实模型名'); return false; }
-      const numOrU = (sel) => { const s = $(sel); if (!s) return undefined; const v = s.value.trim(); return v === '' ? undefined : Number(v); };
+      const numOrU = (sel) => {
+        const s = $(sel);
+        if (!s) return undefined;
+        const v = s.value.trim();
+        if (v === '') return undefined;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : undefined; // NaN/Infinity 一律当未填，避免污染预算计算
+      };
       const body = {
         id,
         providerId: $('#m-prov').value,

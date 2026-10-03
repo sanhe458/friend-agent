@@ -4,7 +4,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { contextBudget, maskKey, saveConfig, type McpServerConfig } from '../config.ts';
+import { contextBudget, maskKey, saveConfig, type McpServerConfig, type ModelDef } from '../config.ts';
 import { withBuiltin } from '../reply/persona.ts';
 import { fetchModelMeta } from '../models/meta.ts';
 import { createMetasoSearch } from '../tools/metaso.ts';
@@ -24,30 +24,71 @@ const json = (res: ServerResponse, code: number, body: unknown) => {
   res.end(JSON.stringify(body));
 };
 
+/**
+ * 读请求体（JSON）。
+ *
+ * ⚠️ 超过上限必须**主动 resolve** 再断开：以前只 `req.destroy()` 就完事，
+ *    destroy 后 `end` 事件不会再触发，这个 Promise 就永远挂着 ——
+ *    每个超大请求都泄漏一个挂起的 handler，是稳定的 DoS 面。
+ */
 const readBody = (req: IncomingMessage): Promise<any> =>
   new Promise((resolve) => {
     let buf = '';
-    req.on('data', (c) => { buf += c; if (buf.length > 1e6) req.destroy(); });
-    req.on('end', () => { try { resolve(buf ? JSON.parse(buf) : {}); } catch { resolve({}); } });
-    req.on('error', () => resolve({}));
+    let done = false;
+    const finish = (v: any) => { if (!done) { done = true; resolve(v); } };
+    req.on('data', (c) => {
+      if (done) return;
+      buf += c;
+      if (buf.length > 1e6) { try { req.destroy(); } catch { /* ignore */ } finish({}); }
+    });
+    req.on('end', () => { try { finish(buf ? JSON.parse(buf) : {}); } catch { finish({}); } });
+    req.on('error', () => finish({}));
+    req.on('close', () => finish({}));
   });
 
-/** 原始 body（签名校验必须基于未解析的原串） */
+/** 原始 body（签名校验必须基于未解析的原串）；超限同样要主动 resolve，理由同上 */
 const readRaw = (req: IncomingMessage): Promise<string> =>
   new Promise((resolve) => {
     let buf = '';
-    req.on('data', (c) => { buf += c; if (buf.length > 2e6) req.destroy(); });
-    req.on('end', () => resolve(buf));
-    req.on('error', () => resolve(''));
+    let done = false;
+    const finish = (v: string) => { if (!done) { done = true; resolve(v); } };
+    req.on('data', (c) => {
+      if (done) return;
+      buf += c;
+      if (buf.length > 2e6) { try { req.destroy(); } catch { /* ignore */ } finish(''); }
+    });
+    req.on('end', () => finish(buf));
+    req.on('error', () => finish(''));
+    req.on('close', () => finish(''));
   });
 
 
-/** 面板公网可达：token 是唯一门禁 */
+/** 常数时间字符串比较：避免 `===` 的短路比较泄漏 token 前缀（时序侧信道） */
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/** 本机来源判定：127.0.0.1 / ::1 / ::ffff:127.0.0.1 */
+function isLoopback(req: IncomingMessage): boolean {
+  const a = req.socket.remoteAddress ?? '';
+  return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
+}
+
+/**
+ * 面板公网可达（listen 0.0.0.0）：token 是唯一门禁。
+ *
+ * ⚠️ 之前是「没配 token 就一律放行」——而 panelToken 默认是空的，
+ *    面板又监听 0.0.0.0，等于**默认装完就是一个公网的、能改 API key、
+ *    能替机器人发消息的后台**。现在改为：没配 token 时**只允许本机访问**。
+ */
 function authorized(req: IncomingMessage, url: URL): boolean {
   const need = holder.current.panelToken;
-  if (!need) return true;
+  if (!need) return isLoopback(req);
   const got = req.headers['x-panel-token'] ?? url.searchParams.get('token');
-  return got === need;
+  return typeof got === 'string' && safeEqual(got, need);
 }
 
 /** 列出 OpenClaw 里可导入的服务商（只给结构，不给 key） */
@@ -71,9 +112,10 @@ function importable(): Array<{ id: string; baseUrl: string; hasKey: boolean; mod
   }
 }
 
-/** 去掉 undefined/null，避免写进配置 */
+/** 去掉 undefined/null（以及 NaN/Infinity），避免写进配置污染预算计算 */
 const clean = (o: Record<string, unknown>): Record<string, unknown> =>
-  Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== null));
+  Object.fromEntries(Object.entries(o).filter(([, v]) =>
+    v !== undefined && v !== null && !(typeof v === 'number' && !Number.isFinite(v))));
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
@@ -84,12 +126,22 @@ const server = createServer(async (req, res) => {
     /** 面板静态资源（样式 / 脚本 / 各页面模块） */
     if (req.method === 'GET' && p.startsWith('/panel/')) {
       const rel = p.slice('/panel/'.length);
-      if (!rel || rel.includes('..')) return json(res, 400, { error: 'bad path' });
+      // ⚠️ 白名单后缀 + 拒空 + 拒 .. —— 不能只靠「URL 规范化会吃掉 %2e%2e」这种隐式行为，
+      //    那属于实现细节，一旦解析路径换了就等于把源码/任意文件读出去。
+      if (!rel || rel.includes('..') || !/\.(css|js|html|map|svg|png|ico)$/i.test(rel)) {
+        return json(res, 400, { error: 'bad path' });
+      }
       try {
         const abs = fileURLToPath(new URL('./public/' + rel, import.meta.url));
+        // 解析后必须仍在 public/ 目录内
+        const root = fileURLToPath(new URL('./public/', import.meta.url));
+        if (!abs.startsWith(root)) return json(res, 403, { error: 'forbidden' });
         const buf = readFileSync(abs);
         const type = rel.endsWith('.css') ? 'text/css; charset=utf-8'
           : rel.endsWith('.js') ? 'application/javascript; charset=utf-8'
+          : rel.endsWith('.html') ? 'text/html; charset=utf-8'
+          : rel.endsWith('.svg') ? 'image/svg+xml'
+          : rel.endsWith('.png') ? 'image/png'
           : 'text/plain; charset=utf-8';
         res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-store' });
         return void res.end(buf);
@@ -133,6 +185,8 @@ const server = createServer(async (req, res) => {
           tools: app.tools.list().length,
         },
         persons,
+        // ⚠️ 以前没这片字段，工具页的「子 agent 专员」永远渲染成空列表
+        specialists: app.orch.specialists(),
         tools: app.tools.list().map((t) => ({ name: t.name, description: t.description, timeoutMs: t.timeoutMs })),
         log: app.log.slice(-200),
         tasks: app.orch.all(),
@@ -160,7 +214,8 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && p === '/api/chat/send') {
       const b = await readBody(req);
       if (!b.text || !b.externalId) return json(res, 400, { error: '缺 text / externalId' });
-      void app.say(b.channel || 'qq', String(b.externalId), String(b.text));
+      void app.say(b.channel || 'qq', String(b.externalId), String(b.text))
+        .catch((err) => app.log.push({ at: Date.now(), dir: 'sys', channel: 'panel', text: `[面板] 发送失败：${(err as Error).message}` }));
       return json(res, 200, { ok: true });
     }
 
@@ -174,6 +229,7 @@ const server = createServer(async (req, res) => {
       if (!b.externalId) return json(res, 400, { error: '缺 externalId' });
       // 带 media 时走完整 inbound（用来模拟“用户发来一段语音”）；否则只当纯文本说一句
       if (Array.isArray(b.media) && b.media.length) {
+        // 异步链路要接住异常，否则面板发消息失败只在控制台留个 unhandled rejection
         void app.inbound({
           channel: (b.channel || 'panel') as never,
           chatType: 'private',
@@ -181,11 +237,12 @@ const server = createServer(async (req, res) => {
           ...(b.text ? { text: String(b.text) } : {}),
           media: b.media as never,
           at: Date.now(),
-        });
+        }).catch((err) => app.log.push({ at: Date.now(), dir: 'sys', channel: 'panel', text: `[面板] 入站处理失败：${(err as Error).message}` }));
         return json(res, 200, { ok: true, withMedia: true });
       }
       if (!b.text) return json(res, 400, { error: '缺 text / externalId' });
-      void app.say(b.channel || 'panel', String(b.externalId), String(b.text));
+      void app.say(b.channel || 'panel', String(b.externalId), String(b.text))
+        .catch((err) => app.log.push({ at: Date.now(), dir: 'sys', channel: 'panel', text: `[面板] 发送失败：${(err as Error).message}` }));
       return json(res, 200, { ok: true });
     }
 
@@ -203,6 +260,11 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && p === '/api/remember') {
       const b = await readBody(req);
       if (!b.personId || !b.text) return json(res, 400, { error: '缺 personId / text' });
+      // ⚠️ 必须确认这个人真的存在：以前直接写，personId 打错就会往库里塞一条
+      //    谁也不认领的孤儿记忆（面板按 persons 遍历，永远显示不出来，却一直留在库里）。
+      if (!app.identity.all().some((x) => x.id === String(b.personId))) {
+        return json(res, 400, { error: `没有这个人：${b.personId}` });
+      }
       app.memory.write(String(b.personId), {
         text: String(b.text), tags: ['panel'], channel: 'panel', at: Date.now(), hot: true,
       });
@@ -236,16 +298,26 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'POST' && p === '/api/merge/request') {
       const b = await readBody(req);
+      // ⚠️ 以前直接 b.from.channel 取属性：from 缺失时抛 TypeError 被外层兜成 500，
+      //    报错信息还看不出是参数问题。这里显式校验。
+      const from = b?.from ?? {};
+      const claim = b?.claim ?? {};
+      if (!from.channel || !from.externalId || !claim.channel || !claim.externalId) {
+        return json(res, 400, { error: '缺 from/claim 的 channel 或 externalId' });
+      }
       try {
-        app.identity.resolve(b.from.channel, b.from.externalId);
-        const r = app.identity.requestMerge(b.from, b.claim);
+        app.identity.resolve(from.channel, from.externalId);
+        const r = app.identity.requestMerge(
+          { channel: String(from.channel), externalId: String(from.externalId) },
+          { channel: String(claim.channel), externalId: String(claim.externalId) },
+        );
         // ⚠️ 真的把码投递到对方对话（之前只返回码，谁都没发）
         let delivered = 'ok';
         try {
           await app.sendTo(
             r.notify.channel,
             r.notify.to,
-            `【身份验证】\n验证码：${r.code}\n\n请到 ${b.from.channel} 那个对话里把上面 6 位数字回给机器人（10 分钟内有效）。`,
+            `【身份验证】\n验证码：${r.code}\n\n请到 ${from.channel} 那个对话里把上面 6 位数字回给机器人（10 分钟内有效）。`,
           );
         } catch (err) {
           delivered = (err as Error).message;
@@ -258,8 +330,17 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'POST' && p === '/api/merge/confirm') {
       const b = await readBody(req);
+      const via = b?.via ?? {};
+      if (!b?.code || !via.channel || !via.externalId) {
+        return json(res, 400, { error: '缺 code / via.channel / via.externalId' });
+      }
       try {
-        return json(res, 200, { ok: true, person: app.identity.confirmMerge(String(b.code), b.via) });
+        return json(res, 200, {
+          ok: true,
+          person: app.identity.confirmMerge(String(b.code), {
+            channel: String(via.channel), externalId: String(via.externalId),
+          }),
+        });
       } catch (err) {
         return json(res, 400, { error: (err as Error).message });
       }
@@ -362,8 +443,8 @@ const server = createServer(async (req, res) => {
       const list = [...(c.models ?? [])];
       const i = list.findIndex((m) => m.id === id);
       const prev = i >= 0 ? list[i] : undefined;
-      const meta = b.meta && typeof b.meta === 'object'
-        ? { ...(prev?.meta ?? {}), ...clean(b.meta), source: 'manual' }
+      const meta: ModelDef['meta'] = b.meta && typeof b.meta === 'object'
+        ? { ...(prev?.meta ?? {}), ...clean(b.meta), source: 'manual' as const }
         : prev?.meta;
       const metaUrl = b.metaUrl ? String(b.metaUrl) : prev?.metaUrl;
       const entry = {
@@ -395,9 +476,8 @@ const server = createServer(async (req, res) => {
     /** 角色/压缩现状（之前只有 POST 没有 GET，前端一直拿到 404） */
     // ── MCP：外部工具挂载（三河 2026-10-02，可勾选给谁用）──
     if (req.method === 'GET' && p === '/api/mcp') {
-      const c = holder.current as Record<string, unknown>;
       return json(res, 200, {
-        servers: c.mcp ?? [],
+        servers: holder.current.mcp ?? [],
         status: app.mcp.status(),
       });
     }
@@ -439,10 +519,9 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && p === '/api/roles') {
-      const c = holder.current as Record<string, unknown>;
       return json(res, 200, {
-        roles: (c.roles as Record<string, string>) ?? {},
-        compression: (c.compression as Record<string, unknown>) ?? {},
+        roles: holder.current.roles ?? {},
+        compression: holder.current.compression ?? {},
       });
     }
 
@@ -715,8 +794,9 @@ const server = createServer(async (req, res) => {
      * 其余事件 —— 校验 Ed25519 签名 → 转 Inbound → 回 op=12 表示已收到
      */
     if (req.method === 'POST' && p === '/qq/webhook') {
-      if (!app.qq) return json(res, 503, { error: 'QQ 通道未配置' });
       const raw = await readRaw(req);
+      // ⚠️ 通道没配也要回 200 —— 返回非 2xx 会让 QQ 平台按策略反复重推同一个事件。
+      if (!app.qq) return json(res, 200, { op: 12, d: {} });
 
       let evt: any = {};
       try { evt = raw ? JSON.parse(raw) : {}; } catch { return json(res, 200, { op: 12, d: {} }); }
@@ -733,10 +813,21 @@ const server = createServer(async (req, res) => {
         app.log.push({ at: Date.now(), dir: 'sys', channel: 'qq', text: '[qq] 回调签名校验失败，已拒绝' });
         return json(res, 401, { op: 12, d: {} });
       }
+      // ⚠️ 签名只证明「来自腾讯」，拦不住**重放**：把带签名的老请求再发一次仍会通过。
+      //    要求时间戳在 ±5 分钟内，超出直接拒（官方文档的推荐做法）。
+      const tsNum = Number(ts) * 1000;
+      if (!Number.isFinite(tsNum) || Math.abs(Date.now() - tsNum) > 5 * 60_000) {
+        app.log.push({ at: Date.now(), dir: 'sys', channel: 'qq', text: '[qq] 回调时间戳过期（疑似重放），已拒绝' });
+        return json(res, 401, { op: 12, d: {} });
+      }
 
       app.log.push({ at: Date.now(), dir: 'sys', channel: 'qq', text: `[qq] ← 回调 ${evt.t ?? '?'}` });
       const inbound = await app.qq.toInbound(evt);
-      if (inbound) void app.inbound(inbound);
+      if (inbound) {
+        // 不接异常：回调处理失败不该让平台以为投递成功/失败反复重推
+        void app.inbound(inbound).catch((err) =>
+          app.log.push({ at: Date.now(), dir: 'sys', channel: 'qq', text: `[qq] 回调处理失败：${(err as Error).message}` }));
+      }
       return json(res, 200, { op: 12, d: {} });
     }
 
@@ -781,11 +872,16 @@ function listen(attempt = 0): void {
     // 重试链路会让 listening 回调多跑一次，启动副作用只做一遍
     if (started) return;
     started = true;
+    const hasToken = Boolean(holder.current.panelToken);
     console.log(
       `[panel] http://0.0.0.0:${port}/  pid=${process.pid}` +
       `  秘塔key=${holder.current.metasoApiKey ? '有' : '无'}` +
-      `  token=${holder.current.panelToken ? '已启用' : '未设'}`,
+      `  token=${hasToken ? '已启用' : '未设（仅本机可访问）'}`,
     );
+    if (!hasToken) {
+      console.log('[panel] ⚠️ 未设置 PANEL_TOKEN：面板监听 0.0.0.0，但只接受本机(127.0.0.1)请求。'
+        + '若要从别的机器访问，请设置 PANEL_TOKEN，否则请求会被拒。');
+    }
     watchConfig();
   });
 }

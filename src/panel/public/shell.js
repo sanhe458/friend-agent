@@ -66,7 +66,9 @@ function toast(msg) {
 }
 
 /* ── 弹窗 ─────────────────────────────── */
-let dlgOk = null;
+/* 弹窗同一时刻只允许一个「确定」在飞：否则连点两下会发两次请求
+   （新增服务商/模型时会各写一份配置）。 */
+let dlgBusy = false;
 function openDlg(title, bodyHtml, okLabel, onOk) {
   $('#dlg-t').textContent = title;
   $('#dlg-b').innerHTML = bodyHtml;
@@ -79,15 +81,32 @@ function openDlg(title, bodyHtml, okLabel, onOk) {
     const ok = document.createElement('button');
     ok.className = 'btn pri'; ok.textContent = okLabel || '保存';
     ok.addEventListener('click', async () => {
-      ok.disabled = true;
-      try { const r = await onOk(); if (r !== false) closeDlg(); } finally { ok.disabled = false; }
+      if (dlgBusy) return; // 已在提交中，忽略重复点击
+      dlgBusy = true; ok.disabled = true;
+      let done = false;
+      try {
+        const r = await onOk();
+        done = r !== false;
+      } catch (e) {
+        // onOk 自己没兜住的异常，别把弹窗卡在禁用态
+        console.error('[dlg]', e);
+        if (typeof toast === 'function') toast('✗ ' + ((e && e.message) || '操作失败'));
+      } finally {
+        dlgBusy = false;
+        ok.disabled = false;
+      }
+      // 先解除 busy 再关，否则 closeDlg 的提交中保护会把合法关闭挡掉
+      if (done && $('#mask').classList.contains('on')) closeDlg();
     });
     f.appendChild(ok);
-    dlgOk = ok;
   }
   $('#mask').classList.add('on');
 }
-function closeDlg() { $('#mask').classList.remove('on'); dlgOk = null; }
+function closeDlg() {
+  if (dlgBusy) return; // 提交中不许关，避免「界面关了但请求已发出」的半截状态
+  $('#mask').classList.remove('on');
+  $('#dlg-b').innerHTML = ''; // 清掉表单，防止残留 input 的 id 被后续 querySelector 误命中
+}
 $('#mask').addEventListener('click', (e) => { if (e.target === $('#mask')) closeDlg(); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDlg(); });
 
@@ -193,7 +212,10 @@ function render() {
   const v = $('#view');
   const t = $('#tacts');
   if (t) t.innerHTML = '';
-  // ⚠️ 快照还没到手时（登录前 / 首次加载中）不能派发到页面，否则各页会读空 ST 抛错
+  // ⚠️ 快照还没到手时（登录前 / 首次加载中）不能派发到页面，否则各页会读空 ST 抛错。
+  //    —— 但要注意：`lastSig` 也**不能**在这里更新。以前在这里就写了 lastSig，
+  //    而真实数据到达前 signature() 基于空 ST 恒为同一个值；等 refresh() 拿到数据再比对时
+  //    「空签名 === 记下的空签名」→ 判定"没变化"→ 永远不再重画，页面白屏（必现）。
   if (!ST) { v.innerHTML = '<div class="empty">加载中…</div>'; return; }
   lastSig = signature();
   lastTab = TAB;
@@ -223,16 +245,11 @@ async function refresh() {
   ST = { state: state || {}, runtime: runtime || {}, qq: qq || {} };
   if (state && state.error) { $('#gate').style.display = 'flex'; render(); return; }
   $('#gate').style.display = 'none';
+  // ⚠️ 以前这里对每个人**再串行请求一次 /api/chat** 只为数记忆条数 ——
+  //    每人一次重请求（要拉完整事件流+记忆+任务），人一多面板就明显卡。
+  //    /api/state 已经带了 memoryCount，直接用它。
   const memCount = {};
-  try {
-    const ps = ST.state.persons || [];
-    for (const p of ps) {
-      const b = (p.bindings || [])[0];
-      if (!b) continue;
-      const d = await api('/api/chat?channel=' + encodeURIComponent(b.channel) + '&externalId=' + encodeURIComponent(b.externalId));
-      memCount[p.id] = (d.memory || []).length;
-    }
-  } catch (e) { /* 忽略 */ }
+  for (const p of (ST.state.persons || [])) memCount[p.id] = p.memoryCount || 0;
   ST.memCount = memCount;
   const rt = ST.runtime;
   $('#sf-pid').textContent = rt.pid || '—';

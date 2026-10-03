@@ -2,6 +2,12 @@ export interface ToolCtx {
   personId: string;
   channel: string;
   chatType: string;
+  /**
+   * 当前对话在该通道内的 externalId。
+   * ⚠️ 以前没有这个字段，identity 工具只能从 bindings 里反查——一个人在同通道
+   *    有多个绑定（QQ 私聊 + 群）时会拿错对话。现在由调用链显式传入。
+   */
+  externalId?: string;
 }
 
 export interface ToolDef {

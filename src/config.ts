@@ -33,7 +33,8 @@ export interface ModelMeta {
   /** 每 1M tokens 的价格 */
   inputPrice?: number;
   outputPrice?: number;
-  source?: 'manual' | 'api';
+  /** 元数据来源：手动填 / 服务商端点 / models.dev 目录 */
+  source?: 'manual' | 'api' | 'catalog';
   fetchedAt?: number;
   note?: string;
 }
@@ -168,6 +169,12 @@ export function configPath(): string {
   return process.env.FRIEND_AGENT_CONFIG ?? fileURLToPath(new URL('../config.local.json', import.meta.url));
 }
 
+/** 解析正整数环境变量/配置；非法（空串 / NaN / ≤0）就退回默认值 */
+function intOr(v: unknown, fallback: number): number {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
 /** 环境变量 > config.local.json > 默认值。config.local.json 不进仓库 */
 export function loadConfig(extraPath?: string): AppConfig {
   const path = extraPath ?? configPath();
@@ -184,8 +191,10 @@ export function loadConfig(extraPath?: string): AppConfig {
   return {
     metasoApiKey: process.env.METASO_API_KEY ?? file.metasoApiKey,
     metasoScope: process.env.METASO_SCOPE ?? file.metasoScope ?? 'webpage',
-    searchSize: Number(process.env.METASO_SIZE ?? file.searchSize ?? 5),
-    panelPort: Number(process.env.PANEL_PORT ?? file.panelPort ?? 8918),
+    // ⚠️ 以前直接 Number(...)：环境变量给空串时 Number('')=0 会让 searchSize 变 0，
+    //    panelPort 变 0（= 随机端口，面板地址每次都变）。这里统一做“非法即默认”。
+    searchSize: intOr(process.env.METASO_SIZE ?? file.searchSize, 5),
+    panelPort: intOr(process.env.PANEL_PORT ?? file.panelPort, 8918),
     panelToken: process.env.PANEL_TOKEN ?? file.panelToken,
     providers: file.providers ?? [],
     models: file.models ?? [],
@@ -218,6 +227,9 @@ export function saveConfig(patch: Partial<AppConfig>, extraPath?: string): AppCo
 
 /** 对外输出时永远不返回明文 key */
 export function maskKey(key?: string): string {
-  if (!key) return '';
-  return '••••' + key.slice(-4);
+  const k = String(key ?? '');
+  if (!k) return '';
+  // 短 key（≤8 位）全遮——只留尾 4 位等于把它泄了个干净
+  if (k.length <= 8) return '••••（已隐藏）';
+  return '••••' + k.slice(-4);
 }

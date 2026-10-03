@@ -4,10 +4,15 @@
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
-  "engines": { "node": ">=22.6" },
+  "engines": {
+    "node": ">=22.6"
+  },
   "scripts": {
     "demo": "node src/index.ts",
     "cli": "node src/index.ts --cli",
     "panel": "node src/panel/server.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5"
   }
 }

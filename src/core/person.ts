@@ -7,7 +7,7 @@ const MAX_CODE_TRIES = 6;
 /** id 带时间戳：重启后不会撞上已恢复的旧档案（以前靠自增 seq，重启归零就可能覆盖别人的档案） */
 const newId = () => 'p_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
-interface PendingMerge { personId: string; binding: Binding; expiresAt: number; tries: number }
+interface PendingMerge { code: string; personId: string; binding: Binding; expiresAt: number; tries: number }
 
 /**
  * 身份解析 + 跨通道合并。
@@ -128,7 +128,7 @@ export class IdentityService {
     const code = String(Math.floor(100000 + Math.random() * 900000));
     this.#sweep();
     this.#pending.set(code, {
-      personId: known.id, binding: newSide, expiresAt: Date.now() + VERIFY_TTL_MS, tries: 0,
+      code, personId: known.id, binding: newSide, expiresAt: Date.now() + VERIFY_TTL_MS, tries: 0,
     });
     return {
       code,
@@ -145,12 +145,17 @@ export class IdentityService {
     if (!pending) throw new Error('验证码无效');
     if (pending.expiresAt < Date.now()) { this.#pending.delete(code); throw new Error('验证码已过期'); }
 
-    // ⚠️ 防爆破：验证码只有 6 位（ 90 万种），而 tryConfirm 对**每条入站消息**都会跑。
-    //    不限制次数的话，攻击者可以在自己那个对话里狂发六位数字硬猜，猜中就把自己的对话
-    //    并进别人的档案，之后能收到对方的记忆。这里：错满 MAX_CODE_TRIES 次就直接作废。
+    // ⚠️ 防爆破：验证码只有 6 位（90 万种），而 tryConfirm 对**每条入站消息**都会跑，
+    //    攻击者能在自己那个对话里狂发六位数字硬猜，猜中就把自己的对话并进别人的档案。
+    //
+    //    但计数**必须按「谁在试」分开**：
+    //      · 不在发起对话里的尝试（比如用户在错误的窗口里回码）—— 只拦下，不计数。
+    //        以前这里是全局 tries++，于是**在错误窗口回一次就把整张验证码废掉**了，
+    //        正确窗口再去回就永远是「验证码无效」（演示第 3 步就是这么挂的，真实场景里
+    //        用户手滑在别的对话回一次码，也再也没法合并）。
+    //      · 只在发起对话里的错误尝试才累计，累计到上限作废。
+    //    这对攻击者毫无损失（他本来就只能在发起对话里猜），却修掉了误伤。
     if (via.channel !== pending.binding.channel || via.externalId !== pending.binding.externalId) {
-      pending.tries += 1;
-      if (pending.tries >= MAX_CODE_TRIES) this.#pending.delete(code);
       throw new Error('验证码要在发起合并的那个对话里回复');
     }
 
@@ -179,6 +184,37 @@ export class IdentityService {
     return owner;
   }
 
+  /**
+   * 入站钩子专用：**猜码**路径。
+   * 与 confirmMerge 的区别是这里会累计爆破计数——只有来源于「发起合并的那个对话」
+   * 的**错误码**才计数（那才是攻击者的猜码行为）。对码成功则直接合并。
+   */
+  tryConfirm(code: string, via: { channel: ChannelId; externalId: string }): Person | undefined {
+    // 先看这个 via 有没有待确认项；没有就直接返回（不算任何人的错）
+    const mine = this.#pendingFor(via);
+    try {
+      const p = this.confirmMerge(code, via);
+      return p;
+    } catch {
+      // 猜码失败：只有「本来就在发起对话里、却猜错码」才累计
+      if (mine) {
+        mine.tries += 1;
+        if (mine.tries >= MAX_CODE_TRIES) this.#pending.delete(mine.code);
+      }
+      return undefined;
+    }
+  }
+
+  /** via 名下的待确认项（含对象引用，供计数用） */
+  #pendingFor(via: { channel: ChannelId; externalId: string }): PendingMerge | undefined {
+    for (const p of this.#pending.values()) {
+      if (p.binding.channel === via.channel && p.binding.externalId === via.externalId) {
+        return p.expiresAt >= Date.now() ? p : undefined;
+      }
+    }
+    return undefined;
+  }
+
   /** 给这个人换人格（personaId 传空 = 恢复用全局默认） */
   setPersona(personId: string, personaId?: string): Person {
     const p = this.#people.get(personId);
@@ -199,11 +235,6 @@ export class IdentityService {
       }
     }
     return undefined;
-  }
-
-  /** 尝试确认合并；失败不抛错（入站钩子直接用它） */
-  tryConfirm(code: string, via: { channel: ChannelId; externalId: string }): Person | undefined {
-    try { return this.confirmMerge(code, via); } catch { return undefined; }
   }
 
   /** 设置惯用通道（回注兜底目标） */

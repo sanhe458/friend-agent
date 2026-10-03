@@ -164,6 +164,11 @@ export interface SchedulerDeps {
   /** 触发时执行；返回一句结果描述（会写进 lastResult） */
   onFire: (job: JobRecord) => Promise<string | void>;
   log: (s: string) => void;
+  /**
+   * 触发链路里**兜底之外**的异常（如投递失败）。
+   * 不接的话，`#fire` 之后的异步链路一旦抛错就是 unhandled rejection。
+   */
+  onError?: (job: JobRecord, err: Error) => void;
   /** 检查间隔，默认 15s */
   intervalMs?: number;
 }
@@ -233,9 +238,14 @@ export class Scheduler {
   async runNow(id: string): Promise<string> {
     const j = this.get(id);
     if (!j) throw new Error('任务不存在');
-    return this.#fire(j, true);
+    if (this.#running.has(id)) throw new Error('上一轮还在跑，请等它结束');
+    this.#running.add(id);
+    try {
+      return await this.#fire(j, true);
+    } finally {
+      this.#running.delete(id);
+    }
   }
-
   start(): void {
     if (this.#timer) return;
     const ms = this.#deps.intervalMs ?? 15_000;
@@ -261,7 +271,9 @@ export class Scheduler {
         // ⚠️ 以前是 `await this.#fire(...)` —— **串行等待**。
         //    ask 类任务的 onFire 要走一整轮模型对话（几十秒到几分钟），这期间
         //    **其他到点的定时任务全部被卡住**。改成发出去就不等，只靠 #running 防重叠。
-        void this.#fire(j, false).finally(() => this.#running.delete(j.id));
+        void this.#fire(j, false)
+          .catch((err) => this.#deps.onError?.(j, err as Error))
+          .finally(() => this.#running.delete(j.id));
       }
     } catch (err) {
       this.#deps.log(`[定时] 检查出错：${(err as Error).message}`);
@@ -281,14 +293,29 @@ export class Scheduler {
       this.#deps.log(`[定时] ${job.id} 执行失败：${(err as Error).message}`);
     }
     const next = { ...job, lastRunAt: Date.now(), runs: job.runs + 1, lastResult: result.slice(0, 200) };
-    const nxt = nextRunAt(job.spec, Date.now(), { lastRunAt: Date.now() });
-    if (nxt) {
-      next.nextAt = nxt;
-    } else {
-      next.enabled = false; // 一次性任务跑完即停
-      next.nextAt = Number.MAX_SAFE_INTEGER;
+    if (!manual) {
+      // ⚠️ 手动触发不改排期（runNow 的注释承诺）：否则 every:2h 手动跑一次会把
+      //    下次触发推迟 2 小时；未到点的一次性任务更会被这里直接禁用。
+      const nxt = nextRunAt(job.spec, Date.now(), { lastRunAt: Date.now() });
+      if (nxt) {
+        next.nextAt = nxt;
+      } else {
+        next.enabled = false; // 一次性任务跑完即停
+        next.nextAt = Number.MAX_SAFE_INTEGER;
+      }
     }
-    this.#deps.persist.saveJob(next);
+    // ⚠️ 任务在跑的过程中可能被用户删了——onFire（ask 类要跑几分钟）结束后
+    //    再 upsert 会把已删除的任务**复活**。先查还在不在，不在就别写回。
+    if (!this.get(job.id)) {
+      this.#deps.log(`[定时] ${job.id} 已在执行期间被删除，不再回写`);
+      return result;
+    }
+    // ⚠️ 回写失败（磁盘写不进去）不该把整条链路炸掉
+    try {
+      this.#deps.persist.saveJob(next);
+    } catch (err) {
+      this.#deps.onError?.(job, err as Error);
+    }
     return result;
   }
 }

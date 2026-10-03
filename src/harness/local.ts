@@ -82,9 +82,15 @@ export function createLocalHarness(deps: { models: ModelRegistry; tools: ToolReg
             out = { error: (err as Error).message };
             isError = true;
           }
-          const s = typeof out === 'string' ? out : JSON.stringify(out);
-          messages.push({ role: 'tool', tool_call_id: tc.id, content: s.slice(0, 4000) });
-          o.onEvent({ type: 'tool', phase: 'end', name: tc.function.name, result: s.slice(0, 2000), isError });
+          // JSON.stringify 遇到循环引用 / BigInt 会抛错；工具输出可能来自任意 MCP 服务器，
+          // 不能让它把整轮对话炸掉
+          let s: string;
+          if (typeof out === 'string') s = out;
+          else {
+            try { s = JSON.stringify(out); } catch { s = String(out); }
+          }
+          messages.push({ role: 'tool', tool_call_id: tc.id, content: (s ?? '').slice(0, 4000) });
+          o.onEvent({ type: 'tool', phase: 'end', name: tc.function.name, result: (s ?? '').slice(0, 2000), isError });
         }
       }
 

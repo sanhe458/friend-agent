@@ -13,7 +13,6 @@ function renderTools(v) {
         specs.map((s) => '<tr><td class="mono">' + esc(s.kind) + '</td><td><b>' + esc(s.label) + '</b></td><td style="color:var(--ink2)">' + esc(s.description) + '</td></tr>').join('') +
         '</tbody></table>' : '<div class="empty">未读取到专员清单</div>') + '</div>';
 }
-
 /* ── 日志 ─────────────────────────────── */
 
 PAGES['tools'] = { render: renderTools };

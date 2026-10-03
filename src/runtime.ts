@@ -68,12 +68,16 @@ function closeOld(old: App | null): void {
 /** 重建 App：配置改动（含 QQ 凭据、模型、服务商、压缩策略）全部即时生效 */
 export function reloadConfig(reason = 'manual'): ReloadInfo {
   const old = app;
+  // ⚠️ 顺序不能反：必须**先停旧实例的适配器，再 build 新实例**。
+  //    closeOld 的注释已经写明了原因（旧长轮询/网关不会自己停，会抢同一个 bot → 409），
+  //    但旧代码是「先 build、后 closeOld」—— 新实例 start() 起来时旧实例还在轮询，
+  //    正好制造出那段双轮询者窗口。closeOld 只依赖旧实例，提前调用完全安全。
+  closeOld(old);
   holder.current = loadConfig();
   app = build();
   for (const l of listeners) {
     try { l(app); } catch { /* ignore */ }
   }
-  closeOld(old);
 
   state.reloadCount += 1;
   state.lastReload = {

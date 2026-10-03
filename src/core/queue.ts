@@ -32,7 +32,10 @@ export class PersonQueue {
 
   run(personId: string, job: (ctx: { drain: () => Injection[] }) => Promise<void>): Promise<void> {
     const prev = this.#chains.get(personId) ?? Promise.resolve();
-    const next = prev
+    // 注意：先建「链体」，再用链体自身做链尾比较——不能直接比较 finally 之后的返回值，
+    // 那已经是另一个 Promise 了，`#chains` 里存的永远对不上，清理就会失效。
+    let chain!: Promise<void>;
+    chain = prev
       .then(async () => {
         this.#active.add(personId);
         try {
@@ -42,8 +45,14 @@ export class PersonQueue {
           this.#slots.delete(personId);
         }
       })
-      .catch((err) => { console.error('[queue]', personId, err); });
-    this.#chains.set(personId, next);
-    return next;
+      .catch((err) => { console.error('[queue]', personId, err); })
+      // ⚠️ 链尾用完要清掉：以前只 set 不 delete，每人会永久留一条已 resolve 的 Promise
+      //    （人一多就是稳定的内存泄漏）。只有「当前这条仍是链尾」时才删，
+      //    否则会把后来者排进来的新链误删、破坏串行。
+      .finally(() => {
+        if (this.#chains.get(personId) === chain) this.#chains.delete(personId);
+      });
+    this.#chains.set(personId, chain);
+    return chain;
   }
 }

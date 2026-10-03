@@ -170,7 +170,9 @@ export function createApp(opts: {
   // 工具要有 orch 才能注册 delegate
   registerBuiltinTools(tools, orch, memory, { search });
   // MCP：把外部工具挂进注册表（audience 决定给谁用，见 src/mcp/client.ts）
-  const mcp = new McpManager(tools, push);
+  // ⚠️ McpManager 的 log 收的是 string，得包成 LogEntry——以前直接把 push 传过去，
+  //    字符串被塞进 LogEntry[]，面板日志页渲染出 undefined。
+  const mcp = new McpManager(tools, (s) => push({ at: Date.now(), dir: 'sys', channel: 'mcp', text: s }));
   // 退出时收掉 MCP 子进程：不接的话，systemd 重启（SIGTERM）会留下逃逸的孤儿子进程（实测过）
   const mcpShutdown = () => { try { mcp.stopAll(); } catch { /* ignore */ } };
   process.once('exit', mcpShutdown);
@@ -178,7 +180,7 @@ export function createApp(opts: {
   process.once('SIGINT', mcpShutdown);
   // 启动就挂；单台失败只记日志，不拖垮主进程（但不能静默吞错——那样连日志都没有）
   mcp.applyAll(getConfig().mcp ?? []).catch((err) => {
-    push({ at: Date.now(), dir: 'sys', text: `[mcp] 启动挂载失败：${(err as Error).message}` });
+    push({ at: Date.now(), dir: 'sys', channel: 'mcp', text: `[mcp] 启动挂载失败：${(err as Error).message}` });
   });
   // 真浏览器（无头 Chromium，CDP 驱动）：工具名 browse
   registerBrowserTool(tools);
@@ -297,6 +299,10 @@ export function createApp(opts: {
 
     push({ at: Date.now(), dir: 'in', channel: msg.channel, to: msg.externalId, personId: person.id, text: msg.text ?? '' });
 
+    // ⚠️ 空消息不该进回复引擎：模型收到空 user 输入只会瞎编，
+    //    没有媒体又没文本的情况（比如语音下载失败）直接吞掉。
+    if (!String(msg.text ?? '').trim() && !(msg.media ?? []).length) return;
+
     if (queue.isActive(person.id)) {
       if (queue.inject(person.id, msg.text ?? '')) {
         push({ at: Date.now(), dir: 'sys', channel: msg.channel, personId: person.id, text: `插话入槽（工具间隙消费）：${msg.text}` });
@@ -394,6 +400,13 @@ export function createApp(opts: {
       });
       return '已触发一轮回复';
     },
+    // ⚠️ 任务目标通道可能已经被删/卸载（比如 QQ 通道关了但 job 还留着）：
+    //    这里兜住异常，否则会变成 unhandled rejection 把进程带走。
+    onError: (job, err) =>
+      push({
+        at: Date.now(), dir: 'sys', channel: '定时',
+        text: `[定时] ${job.id} 执行异常（已隔离，不影响其它任务）：${(err as Error).message}`,
+      }),
   });
   registerScheduleTools(tools, sched, identity);
   registerIdentityTools(tools, identity, sendTo);

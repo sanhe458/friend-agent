@@ -12,8 +12,13 @@ export function registerIdentityTools(
   identity: IdentityService,
   sendTo: (channel: string, to: string, text: string) => Promise<void>,
 ): void {
-  /** 当前对话的 externalId（ToolCtx 里没有，得从绑定里反查） */
-  const currentExternalId = (ctx: { personId: string; channel: string }) => {
+  /**
+   * 当前对话的 externalId。
+   * ⚠️ 优先用 ToolCtx.externalId —— 从 bindings 反查会在「一个人在同一通道有多个对话」
+   *    时拿错（比如 QQ 私聊 + QQ 群都绑在同一个人身上），归并就会认错对象。
+   */
+  const currentExternalId = (ctx: { personId: string; channel: string; externalId?: string }) => {
+    if (ctx.externalId) return ctx.externalId;
     const p = identity.all().find((x) => x.id === ctx.personId);
     return p?.bindings.find((b) => b.channel === ctx.channel)?.externalId;
   };

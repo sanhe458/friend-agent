@@ -35,10 +35,17 @@ export async function compressIfNeeded(opts: {
   let kept = body.slice(-keepCount);
   let dropped = body.slice(0, Math.max(0, body.length - keepCount));
 
-  // 保证不把 tool 消息和它的 assistant(tool_calls) 拆开
-  while (kept.length && kept[0].role === 'tool') kept = kept.slice(1);
-  while (dropped.length && dropped[dropped.length - 1].role === 'assistant' && dropped[dropped.length - 1].tool_calls) {
-    kept = [dropped.pop()!, ...kept];
+  // kept 的起点必须落在「安全边界」上：
+  //   ① 不能是 tool 响应（它的发起方 assistant 在 dropped 里，孤零零没人认领）；
+  //   ② 不能是「发了 tool_calls 却没跟着响应」的 assistant —— 多数端点会直接 400。
+  //   （以前分两个 while：先把开头的 tool 丢掉、再把 assistant(tool_calls) 搬回 kept，
+  //    恰好制造出 ② 说的孤儿 → 压缩后的下一轮必 400。）
+  //   被挪走的消息统一 push 回 dropped，保证摘要能看到完整内容。
+  while (
+    kept.length &&
+    (kept[0].role === 'tool' || (kept[0].role === 'assistant' && kept[0].tool_calls))
+  ) {
+    dropped.push(kept.shift()!);
   }
 
   if (dropped.length === 0) {

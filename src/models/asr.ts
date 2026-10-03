@@ -10,7 +10,8 @@
 
 export interface AsrOptions {
   baseUrl: string;
-  apiKey: string;
+  /** 未配置（undefined/空）时直接抛错，别把 "Bearer undefined" 发出去 */
+  apiKey?: string;
   model: string;
   audio: Uint8Array;
   /** 给服务端看的文件名，带扩展名它才好判断容器格式 */
@@ -31,10 +32,11 @@ function endpointOf(baseUrl: string): string {
 export async function transcribe(opts: AsrOptions): Promise<string> {
   if (!opts.model) throw new Error('没有配置 ASR 模型');
   if (!opts.audio?.length) throw new Error('音频是空的');
+  if (!opts.apiKey) throw new Error('ASR 提供商没有配置 API key');
 
   const form = new FormData();
   const mime = opts.mime || 'audio/ogg';
-  const blob = new Blob([opts.audio as unknown as BlobPart], { type: mime });
+  const blob = new Blob([opts.audio], { type: mime });
   form.append('file', blob, opts.filename || ('audio.' + (mime.split('/')[1] || 'ogg')));
   form.append('model', opts.model);
   if (opts.language) form.append('language', opts.language);
@@ -64,6 +66,15 @@ export function bytesFromDataUrl(url: string): { bytes: Uint8Array; mime: string
   if (!m) return undefined;
   const mime = m[1] || 'application/octet-stream';
   const body = m[3] || '';
-  if (m[2]) return { bytes: new Uint8Array(Buffer.from(body, 'base64')), mime };
-  return { bytes: new Uint8Array(Buffer.from(decodeURIComponent(body), 'utf8')), mime };
+  // ⚠️ base64 解出空字节（畸形数据）或非 base64 分支的 decodeURIComponent 抛错
+  //    （比如 url 里有裸 `%`）都要能兜住 —— 否则一条坏消息就能让整轮对话崩掉。
+  try {
+    if (m[2]) {
+      const bytes = new Uint8Array(Buffer.from(body, 'base64'));
+      return bytes.length ? { bytes, mime } : undefined;
+    }
+    return { bytes: new Uint8Array(Buffer.from(decodeURIComponent(body), 'utf8')), mime };
+  } catch {
+    return undefined;
+  }
 }

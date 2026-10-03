@@ -59,6 +59,17 @@ export class TelegramAdapter implements Adapter {
   #status: TelegramStatus = { ok: false, offset: 0, updates: 0, sent: 0 };
   /** 每个 chat 最近一条消息 id，用于「引用回复」 */
   #lastMsg = new Map<string, number>();
+  /**
+   * 轮询循环的「代次」。每次 start() 递增，循环里发现自己的代次过期就退出。
+   *
+   * ⚠️ 光靠 #stopped 布尔量是不够的：stop() 把 #stopped 置 true 后，若马上又 start()，
+   *    start 会把 #stopped 改回 false —— 此时**旧的循环还在等重试 sleep**，
+   *    它醒来后看到 #stopped 又是 false，就继续跑 → 两个 getUpdates 轮询者并存 → 409 冲突。
+   *    用单调递增的代次才能让「上一代」无条件退场。
+   */
+  #generation = 0;
+  /** 重试等待的唤醒器：stop() 时立刻打断，不用干等最多 60s */
+  #retryWake: (() => void) | null = null;
 
   constructor(cfg: TelegramConfig, log: (s: string) => void = () => {}) {
     this.#cfg = cfg;
@@ -77,6 +88,7 @@ export class TelegramAdapter implements Adapter {
     this.#polling = true;
     this.#emit = emit;
     this.#stopped = false;
+    this.#generation += 1; // 让上一代轮询循环（若有残留）退场
     try {
       const me = await this.#call('getMe', {}, 10_000);
       const name = me?.result?.username ? '@' + me.result.username : String(me?.result?.first_name ?? 'bot');
@@ -95,8 +107,30 @@ export class TelegramAdapter implements Adapter {
   async stop(): Promise<void> {
     this.#stopped = true;
     this.#polling = false;
+    this.#generation += 1; // 让当前循环这一代作废
     // 立即中断卡在长轮询里的那次请求，否则要等最多 25s 才退出
     try { this.#pollAbort?.abort(); } catch { /* ignore */ }
+    // 也叫醒重试等待，别让它干等最多 60s
+    this.#retryWake?.();
+    this.#retryWake = null;
+  }
+
+  /** 可被打断的等待：stop() 时立刻醒来 */
+  #sleepUnlessStopped(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+        timer = null;
+        this.#retryWake = null;
+        resolve();
+      }, ms);
+      timer.unref?.();
+      this.#retryWake = () => {
+        if (timer) clearTimeout(timer);
+        timer = null;
+        this.#retryWake = null;
+        resolve();
+      };
+    });
   }
 
   /* ── 底层调用 ───────────────────────────── */
@@ -126,11 +160,25 @@ export class TelegramAdapter implements Adapter {
     return list.includes(Number(chatId));
   }
 
+  /** 每个 chat 只留最近一条消息 id；长期运行 Map 不能无限涨 */
+  #rememberMsgTrim(): void {
+    if (this.#lastMsg.size <= 2000) return;
+    const drop = this.#lastMsg.size - 1000;
+    let i = 0;
+    for (const k of this.#lastMsg.keys()) {
+      if (i++ >= drop) break;
+      this.#lastMsg.delete(k);
+    }
+  }
+
   /* ── 收消息（长轮询）────────────────────── */
   async #pollLoop(): Promise<void> {
     const wait = Math.min(Math.max(this.#cfg.pollSeconds ?? 25, 1), 50);
+    const gen = this.#generation; // 本代次；一旦别处 start/stop 就会变
     let backoff = 1000;
-    while (!this.#stopped) {
+    // 本代次是否还有效（比 #stopped 更强：能识别“被新的一代替换掉”）
+    const alive = () => !this.#stopped && this.#generation === gen;
+    while (alive()) {
       this.#pollAbort = new AbortController();
       try {
         const j = await this.#call('getUpdates', {
@@ -151,6 +199,7 @@ export class TelegramAdapter implements Adapter {
           if (!text && !voice) continue;    // 其他类型（图片等）暂不处理
 
           this.#lastMsg.set(chatId, Number(m.message_id));
+          this.#rememberMsgTrim();
           if (!this.#allowed(chatId)) {
             this.#log(`[tg] 忽略未授权的 chat ${chatId}`);
             continue;
@@ -167,6 +216,21 @@ export class TelegramAdapter implements Adapter {
             } catch (err) {
               this.#log(`[tg] 语音下载失败：${(err as Error).message}`);
             }
+          }
+
+          // ⚠️ 语音下载失败且没有文字时**不能发一条空消息**下去——
+          //    那会让模型收到空 user 输入。改成告知对方语音没收到，让其打字。
+          if (!text && !media) {
+            if (voice?.file_id) {
+              this.#emit?.({
+                channel: 'telegram',
+                chatType: m.chat?.type === 'private' ? 'private' : 'group',
+                externalId: chatId,
+                text: '（我发了一条语音，但系统提示语音下载失败、无法识别，请转成文字再说一次）',
+                at: Date.now(),
+              });
+            }
+            continue;
           }
 
           const name = m.from?.first_name
@@ -186,14 +250,16 @@ export class TelegramAdapter implements Adapter {
         this.#status.ok = true;
         delete this.#status.lastError;
       } catch (err) {
-        if (this.#stopped) return; // 因为 stop() 被中断，不是错
+        if (!alive()) return; // 因为 stop() / 新一代接管被中断，不是错
         const e = err as Error & { retryAfter?: number };
         this.#status.lastError = e.message;
         // 鉴权类错误（401/404）不重试得那么勤
         const hard = /401|404|Unauthorized|not found/.test(e.message);
         const sleep = e.retryAfter ? e.retryAfter * 1000 : (hard ? 60_000 : Math.min(backoff, 30_000));
         this.#log(`[tg] 轮询出错，${Math.round(sleep / 1000)}s 后重试：${e.message}`);
-        await new Promise((r) => setTimeout(r, sleep));
+        // 可中断的等待：stop() 时不必干等最多 60s
+        await this.#sleepUnlessStopped(sleep);
+        if (!alive()) return;
         if (!hard && !e.retryAfter) backoff = Math.min(backoff * 2, 30_000);
       }
     }

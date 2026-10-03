@@ -91,7 +91,10 @@ export function registerBuiltinTools(
     run: async (args: { prompt: string }, ctx) => {
       const { taskId } = orch.dispatch({
         personId: ctx.personId,
-        origin: { personId: ctx.personId, channel: ctx.channel, externalId: '' },
+        // ⚠️ 这里必须带上当前对话的 externalId：回注时若该 person 没有能匹配
+        //    origin.channel 的绑定，就会退回用 origin.externalId 投递 —— 以前这里
+        //    硬编码成 ''，于是「任务完成 → 回注」会往空地址发，直接投递失败。
+        origin: { personId: ctx.personId, channel: ctx.channel, externalId: ctx.externalId ?? '' },
         prompt: args.prompt,
       });
       return { accepted: true, taskId };

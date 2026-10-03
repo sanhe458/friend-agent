@@ -77,16 +77,19 @@ async function once(opts: {
   }
 
   const data = (await res.json()) as {
-    choices?: Array<{ message?: { content?: unknown; tool_calls?: ToolCall[] } }>;
+    choices?: Array<{ message?: { content?: unknown; tool_calls?: ToolCall[] }; finish_reason?: string }>;
     usage?: unknown;
   };
   const msg = data.choices?.[0]?.message;
   const content = msg?.content;
+  // finish_reason=length → max_tokens 截断，标记出来别当完整答案
+  const cutByLimit = data.choices?.[0]?.finish_reason === 'length';
   return {
     text: typeof content === 'string' ? content : (content == null ? '' : JSON.stringify(content)),
     ms,
     toolCalls: Array.isArray(msg?.tool_calls) ? msg.tool_calls : [],
     usage: data.usage,
+    ...(cutByLimit ? { truncated: true, truncateReason: '达到 max_tokens 上限，输出被截断' } : {}),
   };
 }
 
@@ -175,6 +178,7 @@ export async function chatStream(opts: {
   let buf = '';
   let text = '';
   let usage: unknown;
+  let hitLengthLimit = false;
   const calls = new Map<number, ToolCall>();
 
   const consume = (payload: string) => {
@@ -182,7 +186,10 @@ export async function chatStream(opts: {
     let rec: any;
     try { rec = JSON.parse(payload); } catch { return; }
     if (rec.usage) usage = rec.usage;
-    const d = rec.choices?.[0]?.delta;
+    const choice = rec.choices?.[0];
+    const d = choice?.delta;
+    // max_tokens 截断：标记出来，让上层知道这不是完整答案
+    if (choice?.finish_reason === 'length') hitLengthLimit = true;
     if (!d) return;
     if (typeof d.content === 'string' && d.content) {
       text += d.content;
@@ -200,19 +207,29 @@ export async function chatStream(opts: {
     }
   };
 
+  /** 处理一段已按行切好的缓冲（读取循环与收尾 flush 共用） */
+  const drainBuf = () => {
+    const lines = buf.split('\n');
+    buf = lines.pop() ?? '';
+    for (const line of lines) {
+      const s = line.replace(/\r$/, '');
+      if (!s.startsWith('data:')) continue;
+      consume(s.slice(5).trim());
+    }
+  };
+
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop() ?? '';
-      for (const line of lines) {
-        const s = line.replace(/\r$/, '');
-        if (!s.startsWith('data:')) continue;
-        consume(s.slice(5).trim());
-      }
+      drainBuf();
     }
+    // ⚠️ 流结束后 buf 里可能还压着**最后一行**（有的服务最后一帧不以 \n 结尾）。
+    //    以前直接丢掉——最后一帧正是含 finish_reason 的那帧。必须补一次 flush。
+    buf += decoder.decode();
+    drainBuf();
+    if (buf.trim().startsWith('data:')) consume(buf.trim().slice(5).trim());
   } catch (err) {
     // 一个字节都没收到：退回非流式（那边会再试一次）
     if (!text) return fallbackStream(opts, err as Error);
@@ -232,7 +249,15 @@ export async function chatStream(opts: {
     .map(([, v]) => v)
     .filter((c) => c.function.name);
 
-  return { text, ms: Date.now() - t0, toolCalls, usage };
+  return {
+    text,
+    ms: Date.now() - t0,
+    toolCalls,
+    usage,
+    // ⚠️ hitLengthLimit 不看 text 是否为空：截断可能发生在纯工具调用阶段
+    //    （text 为空但 arguments 只收到半截），上层要靠这个标记拒执行
+    ...(hitLengthLimit ? { truncated: true, truncateReason: '达到 max_tokens 上限，输出被截断' } : {}),
+  };
 }
 
 /** 流式不可用时：整段拿到再一次性吐 */
@@ -240,7 +265,12 @@ async function fallbackStream(
   opts: Parameters<typeof chatStream>[0],
   cause: Error,
 ): Promise<ChatResult> {
-  const r = await once({
+  // ⚠️ 这里必须走 chatCompletion 而不是 once：
+  //    有些端点**两者都不支持 tools**，直连 once 会因带 tools 报错，
+  //    而这条路径（流式失败→回退）正是最可能碰上“端点很弱”的场景，
+  //    结果就是流式失败后回退也失败，用户什么都拿不到。
+  //    走 chatCompletion 才能复用「明确不支持 tools 时才去掉重试」的降级。
+  const r = await chatCompletion({
     provider: opts.provider,
     model: opts.model,
     messages: opts.messages,

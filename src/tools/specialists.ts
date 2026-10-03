@@ -21,7 +21,8 @@ export function registerSpecialistTools(
       run: async (args: { prompt: string }, ctx) => {
         const r = orch.dispatch({
           personId: ctx.personId,
-          origin: { personId: ctx.personId, channel: ctx.channel, externalId: '' },
+          // 同 delegate：必须带当前对话的 externalId，否则回注时可能往空地址投递
+          origin: { personId: ctx.personId, channel: ctx.channel, externalId: ctx.externalId ?? '' },
           prompt: args.prompt,
           kind: s.kind,
         });

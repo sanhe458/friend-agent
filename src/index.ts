@@ -29,21 +29,25 @@ async function demo(): Promise<void> {
   await app.say('qq', '10001', '记住我下周三要体检');
   await settle();
 
-  console.log('\n=== 3. 跨通道合并：验证必须在「已知通道」内完成 ===');
+  console.log('\n=== 3. 跨通道合并：验证码发到已知通道，必须回发起对话确认 ===');
   app.identity.resolve('telegram', '20002');
   const pending = app.identity.requestMerge(
     { channel: 'telegram', externalId: '20002' },
     { channel: 'qq', externalId: '10001' },
   );
   console.log(`  验证码发往已知通道 ${pending.notify.channel}:${pending.notify.to}  码=${pending.code}`);
+  console.log(`  应该在这个对话里回码：${pending.confirmIn.channel}:${pending.confirmIn.externalId}`);
+  // ⚠️ 以前这里断言反了：在**发起方**(TG) 回码判成「不该成功」、在**已知通道**(QQ) 回码判成
+  //    「成功」。实际设计正好相反 —— 码发到已知通道是为了证明你能收到它，
+  //    回码必须发生在发起对话里，才证明两边是同一个人在操作。
   try {
-    app.identity.confirmMerge(pending.code, { channel: 'telegram', externalId: '20002' });
-    console.log('  ✗ 不该成功');
+    app.identity.confirmMerge(pending.code, { channel: 'qq', externalId: '10001' });
+    console.log('  ✗ 不该成功（已知通道只收码，不回码）');
   } catch (err) {
-    console.log('  ✓ 在 TG 上确认被拒：', (err as Error).message);
+    console.log('  ✓ 在已知通道(QQ)回码被拒：', (err as Error).message);
   }
-  const merged = app.identity.confirmMerge(pending.code, { channel: 'qq', externalId: '10001' });
-  console.log(`  ✓ 在 QQ 上确认成功 → ${merged.id}｜bindings=${merged.bindings.map((b) => `${b.channel}:${b.externalId}`).join(', ')}`);
+  const merged = app.identity.confirmMerge(pending.code, { channel: 'telegram', externalId: '20002' });
+  console.log(`  ✓ 在发起对话(TG)确认成功 → ${merged.id}｜bindings=${merged.bindings.map((b) => `${b.channel}:${b.externalId}`).join(', ')}`);
   console.log(`  QQ 与 TG 现在是同一个人：`, app.identity.resolve('telegram', '20002').id === merged.id);
 
   console.log('\n=== 4. 工具间隙插话（秘塔搜索在跑，期间用户改主意）===');

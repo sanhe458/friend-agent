@@ -7,11 +7,21 @@ import type { IdentityService } from '../core/person.ts';
  * 例：用户说“明天早上 8 点提醒我开会”，agent 自己调 schedule_task。
  */
 export function registerScheduleTools(reg: ToolRegistry, sched: Scheduler, identity: IdentityService): void {
-  /** 把“当前这个人”解析成可用于投递的 channel + externalId */
-  const targetOf = (personId: string, preferChannel: string) => {
+  /**
+   * 把「当前这个人」解析成可用于投递的 channel + externalId。
+   *
+   * ⚠️ 优先按 (channel, externalId) 精确命中当前对话：以前只用 channel 匹配，
+   *    一个人同一通道有多个对话时（QQ 私聊 + QQ 群）会取到 `bindings[0]`，
+   *    于是「在私聊里排的提醒」被发到群里。
+   */
+  const targetOf = (personId: string, preferChannel: string, preferExternalId?: string) => {
     const p = identity.all().find((x) => x.id === personId);
     if (!p) return undefined;
-    const pick = p.bindings.find((b) => b.channel === preferChannel)
+    const pick =
+      (preferExternalId
+        ? p.bindings.find((b) => b.channel === preferChannel && b.externalId === preferExternalId)
+        : undefined)
+      ?? p.bindings.find((b) => b.channel === preferChannel)
       ?? p.bindings.find((b) => b.channel === p.preferredChannel)
       ?? p.bindings[0];
     return pick ? { channel: pick.channel, to: pick.externalId } : undefined;
@@ -35,7 +45,7 @@ export function registerScheduleTools(reg: ToolRegistry, sched: Scheduler, ident
     },
     timeoutMs: 1500,
     run: async (args: any, ctx) => {
-      const t = targetOf(ctx.personId, ctx.channel);
+      const t = targetOf(ctx.personId, ctx.channel, ctx.externalId);
       if (!t) throw new Error('这个人还没有可用通道，无法排任务');
       const job = sched.add({
         spec: String(args.spec ?? ''),

@@ -44,6 +44,13 @@ function safeJson(s: string): unknown {
   try { return s ? JSON.parse(s) : {}; } catch { return {}; }
 }
 
+/** 工具返回值序列化：循环引用 / BigInt / undefined 都不能把一轮对话炸掉 */
+function safeStringify(v: unknown): string {
+  if (v === undefined) return '';
+  if (typeof v === 'string') return v;
+  try { return JSON.stringify(v) ?? ''; } catch { return String(v); }
+}
+
 /**
  * 前台回复引擎。
  * 配了 reply 角色的模型 → 真模型 + 工具循环；没配 → 退回规则桩（保证链路永远能跑）。
@@ -213,7 +220,32 @@ export class ReplyEngine {
         break;
       }
 
-      if (res.toolCalls.length === 0) { reply = res.text.trim(); break; }
+      // ⚠️ 截断的输出绝不能驱动工具调用：finish_reason=length 时工具参数 JSON
+      //    可能只收到半截，safeJson 解析失败会静默回退 {}——等于拿着空参数
+      //    去执行 write/schedule 这类写操作。截断一律当最终文本收场。
+      if (res.truncated && res.toolCalls.length > 0) {
+        reply = (res.text || '').trim() || '（生成中断，没能发起完整的操作）';
+        reply += '\n（⚠ 生成中断：' + (res.truncateReason ?? '输出被截断') + '）';
+        this.#emit(person.id, {
+          kind: 'notice', at: Date.now(),
+          text: `输出被截断（含未完整的工具调用，已放弃执行）：${res.truncateReason ?? '未知原因'}`,
+        }, true);
+        break;
+      }
+
+      if (res.toolCalls.length === 0) {
+        reply = res.text.trim();
+        // 截断（网络中断 / 达到 max_tokens）要让用户与时间线都看得见，
+        // 不能把半截话当完整答案悄悄发出去
+        if (res.truncated && reply) {
+          reply += '\n（⚠ 生成中断：' + (res.truncateReason ?? '输出被截断') + '）';
+          this.#emit(person.id, {
+            kind: 'notice', at: Date.now(),
+            text: `输出被截断：${res.truncateReason ?? '未知原因'}`,
+          }, true);
+        }
+        break;
+      }
       visible = before + (res.text ?? '');
 
       messages.push({ role: 'assistant', content: res.text || '', tool_calls: res.toolCalls });
@@ -224,12 +256,13 @@ export class ReplyEngine {
         try {
           out = await this.#tools.call(tc.function.name, safeJson(tc.function.arguments), {
             personId: person.id, channel: msg.channel, chatType: msg.chatType,
+            externalId: msg.externalId,
           });
         } catch (err) {
           out = { error: (err as Error).message };
           isErr = true;
         }
-        const s = typeof out === 'string' ? out : JSON.stringify(out);
+        const s = typeof out === 'string' ? out : safeStringify(out);
         messages.push({ role: 'tool', tool_call_id: tc.id, content: s.slice(0, MAX_TOOL_RESULT) });
         this.#emit(person.id, {
           kind: 'tool', at: Date.now(), name: tc.function.name,
@@ -298,7 +331,7 @@ export class ReplyEngine {
     injections: string[],
     boundary: () => void,
   ): Promise<Outbound> {
-    const toolCtx = { personId: person.id, channel: msg.channel, chatType: msg.chatType };
+    const toolCtx = { personId: person.id, channel: msg.channel, chatType: msg.chatType, externalId: msg.externalId };
     const memNote = recalled.length ? recalled.map((m) => m.text).join(' / ') : '（暂无）';
     let reply: string;
 

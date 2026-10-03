@@ -42,7 +42,9 @@ async function tickChat() {
   if (TAB !== 'chat' || !chatId) return;
   const d = await api('/api/chat?channel=' + encodeURIComponent(chatCh) + '&externalId=' + encodeURIComponent(chatId));
   const evs = d.events || [];
-  const key = evs.length + '|' + (d.draft ? d.draft.length : 0);
+  // ⚠️ running 也要进 key：事件数是 append-only 的（长度变=内容变），但「正在处理」是独立状态，
+  //    不计入就会导致这一轮开始时状态标签不刷新（一直显示上一次的“正在处理/已结束”）。
+  const key = evs.length + '|' + (d.draft ? d.draft.length : 0) + '|' + (d.running ? 1 : 0);
   $('#c-stat').innerHTML = d.error ? '读取失败' : (d.running ? '<span class="tag warn">正在处理</span>' : (d.person ? '<span class="tag info">' + esc(d.person.id) + '</span>' : '<span class="tag">还没有对话</span>'));
   if (key === lastChatKey) return;
   lastChatKey = key;

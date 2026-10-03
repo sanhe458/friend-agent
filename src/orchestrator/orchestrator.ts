@@ -9,6 +9,15 @@ import type { Task, TaskEvent, TaskRunner } from './types.ts';
  *
  * 具体怎么跑交给注入的 TaskRunner（背后是 Pi / 进程内 harness / 假实现）。
  */
+/**
+ * 内存里保留的任务上限。超了就淘汰最旧的**已结束**任务（running 的绝不淘汰）。
+ *
+ * ⚠️ 以前 `#tasks` 只加不删：每个 dispatch 都永久留一个 Task 对象，
+ *    面板的 `/api/state`、`list()`、`all()` 又都是全量扫描——
+ *    跑上几周（尤其配了定时 ask 任务）任务表会稳定膨胀。库里没有上限，两边一起涨。
+ */
+const MAX_TASKS_IN_MEMORY = 500;
+
 export class Orchestrator {
   #tasks = new Map<string, Task>();
   #handlers = new Set<(e: TaskEvent) => void>();
@@ -81,6 +90,7 @@ export class Orchestrator {
     this.#tasks.set(id, task);
     this.#persist?.saveTask(task);
     this.#emit({ taskId: id, kind: 'accepted' });
+    this.#evictOldTasks();
 
     const runner = this.#runners.get(kind) ?? this.#fallback;
 
@@ -89,9 +99,16 @@ export class Orchestrator {
         task.status = 'done';
         task.progress = 100;
         task.result = '没有可用的执行者（既没有子 agent 模型，也没有兜底 runner）';
+        this.#persist?.saveTask(task);
         this.#emit({ taskId: id, kind: 'done', text: task.result });
         return;
       }
+      const fail = (err: unknown) => {
+        task.status = 'failed';
+        task.result = `执行器抛错：${(err as Error).message}`;
+        this.#persist?.saveTask(task);
+        this.#emit({ taskId: id, kind: 'done', text: task.result });
+      };
       try {
         // ⚠️ runner 返回 Promise —— 不接住的话，外面这个 try/catch **抓不到异步抛错**（会变成 unhandled rejection）
         void Promise.resolve(runner(task, (e) => {
@@ -101,15 +118,10 @@ export class Orchestrator {
             this.#persist?.saveTask(task);
           }
           this.#emit(e);
-        })).catch((err) => {
-          task.status = 'failed';
-          this.#emit({ taskId: id, kind: 'done', text: `执行器抛错：${(err as Error).message}` });
-        });
+        })).catch(fail);
       } catch (err) {
         // 同步抛错（runner 里的逻辑在调用时就炸了）
-        task.status = 'failed';
-        const text = `执行器抛错：${(err as Error).message}`;
-        this.#emit({ taskId: id, kind: 'done', text });
+        fail(err);
       }
     });
 
@@ -119,4 +131,18 @@ export class Orchestrator {
   status(taskId: string): Task | undefined { return this.#tasks.get(taskId); }
   list(personId: string): Task[] { return [...this.#tasks.values()].filter((t) => t.personId === personId); }
   all(): Task[] { return [...this.#tasks.values()]; }
+
+  /** 超上限就淘汰最旧的已结束任务（running 的绝不动，否则会丢进度） */
+  #evictOldTasks(): void {
+    if (this.#tasks.size <= MAX_TASKS_IN_MEMORY) return;
+    const finished = [...this.#tasks.values()]
+      .filter((t) => t.status !== 'running')
+      .sort((a, b) => a.createdAt - b.createdAt);
+    let over = this.#tasks.size - MAX_TASKS_IN_MEMORY;
+    for (const t of finished) {
+      if (over <= 0) break;
+      this.#tasks.delete(t.id);
+      over -= 1;
+    }
+  }
 }

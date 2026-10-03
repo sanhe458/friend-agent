@@ -54,6 +54,8 @@ type RpcMsg = { jsonrpc: '2.0'; id?: number | string; method?: string; result?: 
 class McpConnection {
   #proc: ReturnType<typeof spawn> | null = null;
   #waits = new Map<number, (m: RpcMsg) => void>();
+  /** 服务端通知（进度/日志等）。目前没有消费方，只留最近 50 条供诊断——
+   *  ⚠️ 以前是无界数组：健谈的服务器（每次工具调用都推 progress）会把它撑到爆内存。 */
   #notifs: Array<{ method: string; params?: any }> = [];
   #seq = 0;
   #buf = '';
@@ -124,7 +126,10 @@ class McpConnection {
       this.#waits.delete(Number(m.id));
       return;
     }
-    if (m.method) this.#notifs.push({ method: m.method, params: (m as any).params });
+    if (m.method) {
+      this.#notifs.push({ method: m.method, params: (m as any).params });
+      if (this.#notifs.length > 50) this.#notifs.splice(0, this.#notifs.length - 50);
+    }
   }
 
   #request(method: string, params: unknown, timeoutMs: number): Promise<RpcMsg> {

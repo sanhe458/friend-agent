@@ -1,5 +1,5 @@
 import { createPrivateKey, createPublicKey, sign as edSign, verify as edVerify } from 'node:crypto';
-import type { Capabilities, Inbound, Outbound } from '../core/types.ts';
+import type { Capabilities, Inbound, MediaRef, Outbound } from '../core/types.ts';
 import type { Adapter, StreamHandle } from './adapter.ts';
 
 const TOKEN_URL = 'https://bots.qq.com/app/getAppAccessToken';
@@ -97,6 +97,13 @@ export class QQAdapter implements Adapter {
   #emit: ((m: Inbound) => void) | null = null;
   #stopped = false;
   #connecting = false;
+  /**
+   * 连接代次。stop() 后旧循环可能还活在 await 里（TCP 关闭/等待定时器都要时间），
+   * 若此时又 start()，`#stopped` 一复位旧循环就会“复活”，于是**两个 #connectLoop 并存**、
+   * 双双 IDENTIFY —— QQ 网关只认一个会话，结果是互相顶掉、无限重连。
+   * 用单调递增的代次判定“我这一轮还算不算数”。
+   */
+  #generation = 0;
   #status: QQStatus = { online: false, gatewayConnected: false, lastSeq: null, reconnects: 0, dispatchCount: 0 };
   /** 遇到配置类错误（IP 白名单/频率限制）就长退避，别继续烧配额 */
   #policyBackoff = false;
@@ -113,6 +120,9 @@ export class QQAdapter implements Adapter {
       this.#log('[qq] 未启用网关（配置 qq.gateway=false），入站完全依赖 Webhook');
       return;
     }
+    // 允许 stop 后再 start：复位停止标志并推进代次，让旧循环自然退场
+    this.#stopped = false;
+    this.#generation += 1;
     void this.#connectLoop();
   }
 
@@ -143,13 +153,16 @@ export class QQAdapter implements Adapter {
 
   async #connectLoop(): Promise<void> {
     let attempt = 0;
-    while (!this.#stopped) {
+    const gen = this.#generation;
+    const alive = () => !this.#stopped && this.#generation === gen;
+    while (alive()) {
       try {
         await this.#connectOnce();
         attempt = 0;
         this.#policyBackoff = false;
         await this.#untilClosed();
       } catch (err) {
+        if (!alive()) return;
         const msg = (err as Error).message;
         this.#status.lastError = msg;
         this.#log(`[qq] 网关连接失败：${msg}`);
@@ -158,7 +171,7 @@ export class QQAdapter implements Adapter {
           this.#log('[qq] 这是配置/限流问题（IP 白名单或频率限制），改为 5 分钟一次，不再快速重试');
         }
       }
-      if (this.#stopped) break;
+      if (!alive()) return;
       this.#status.gatewayConnected = false;
       this.#status.online = false;
       const delay = this.#policyBackoff
@@ -343,8 +356,9 @@ export class QQAdapter implements Adapter {
     this.#heartbeat = null;
   }
 
-  stop(): void {
+  stop(): Promise<void> {
     this.#stopped = true;
+    this.#generation += 1; // 让正在 await 的旧循环立刻失效
     this.#clearHeartbeat();
     this.#ws?.close();
     this.#ws = null;
@@ -353,6 +367,7 @@ export class QQAdapter implements Adapter {
     this.#sleepTimer = null;
     this.#sleepWake?.();
     this.#sleepWake = null;
+    return Promise.resolve();
   }
 
   // ── 鉴权 ────────────────────────────────────────────
@@ -557,9 +572,14 @@ export class QQAdapter implements Adapter {
     if (!id) return true;
     if (this.#seen.has(id)) return false;
     this.#seen.add(id);
+    // 涨过头就一次清到半数（以前每次只删 1 个，大小始终贴着上限晃）
     if (this.#seen.size > 500) {
-      const first = this.#seen.values().next().value;
-      if (first) this.#seen.delete(first);
+      const drop = this.#seen.size - 300;
+      let i = 0;
+      for (const k of this.#seen) {
+        if (i++ >= drop) break;
+        this.#seen.delete(k);
+      }
     }
     return true;
   }
@@ -590,6 +610,20 @@ export class QQAdapter implements Adapter {
     }
   }
 
+  /** 记录「会话最近一条入站」；顺带修剪，别让 Map 无限涨（每个会话一条，长期运行会累积） */
+  #rememberLast(to: string, msgId: string, eventId: string): void {
+    this.#last.set(to, { msgId, eventId });
+    if (this.#last.size > 2000) {
+      // 删掉最旧的一半（Map 保持插入序）
+      const drop = this.#last.size - 1000;
+      let i = 0;
+      for (const k of this.#last.keys()) {
+        if (i++ >= drop) break;
+        this.#last.delete(k);
+      }
+    }
+  }
+
   /** QQ 回调事件 → Inbound；不是消息事件就返回 undefined */
   async toInbound(evt: any): Promise<Inbound | undefined> {
     const d = evt?.d;
@@ -600,7 +634,7 @@ export class QQAdapter implements Adapter {
       const openid = String(d.author?.user_openid ?? '');
       if (!openid) return undefined;
       const to = `c2c:${openid}`;
-      this.#last.set(to, { msgId: String(d.id ?? ''), eventId: String(evt.id ?? '') });
+      this.#rememberLast(to, String(d.id ?? ''), String(evt.id ?? ''));
       const vm = await this.#voiceMedia(d);
       const text = String(d.content ?? '').trim() || vm.fallbackText || '';
       if (!text && !vm.media) return undefined;
@@ -616,7 +650,7 @@ export class QQAdapter implements Adapter {
       const gid = String(d.group_openid ?? '');
       if (!gid) return undefined;
       const to = `group:${gid}`;
-      this.#last.set(to, { msgId: String(d.id ?? ''), eventId: String(evt.id ?? '') });
+      this.#rememberLast(to, String(d.id ?? ''), String(evt.id ?? ''));
       const vm = await this.#voiceMedia(d);
       const text = String(d.content ?? '').trim() || vm.fallbackText || '';
       if (!text && !vm.media) return undefined;
@@ -638,7 +672,10 @@ export class QQAdapter implements Adapter {
    * 32 字符的 secret 按此规则就是它自己。
    */
   #seed(): Buffer {
-    let s = this.#cfg.clientSecret;
+    let s = String(this.#cfg.clientSecret ?? '');
+    // ⚠️ 空串时 `s += s` 永远拼不出长度 → 死循环挂死进程。上游本会校验非空，
+    //    但回调路径一旦被改配置绕过就是灾难，这里硬防一道。
+    if (!s) throw new Error('clientSecret 为空，无法派生回调签名密钥');
     while (s.length < 32) s += s;
     return Buffer.from(s.slice(0, 32), 'utf8');
   }
