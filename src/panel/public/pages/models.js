@@ -121,7 +121,7 @@ function modelDialog(provs, existing) {
     '</select></label>' +
     '<label class="f"><span>真实模型名（发给 API 的那个）</span><input id="m-model" value="' + esc(m.model || '') + '" placeholder="deepseek-chat"></label>' +
     '<label class="f"><span>类型</span><select id="m-kind">' +
-      ['chat:对话/推理（默认）', 'asr:语音转文字（收语音时用）', 'tts:文字转语音（预留）', 'vision:图像理解（预留）', 'embedding:向量（预留）']
+      ['chat:对话/推理（默认）', 'asr:语音转文字（收语音时用）', 'tts:文字转语音（预留）', 'vision:图像理解（预留）', 'embedding:向量（记忆语义召回）', 'rerank:重排序（记忆召回精排）']
         .map((x) => { const [v, t] = x.split(':'); return '<option value="' + v + '"' + ((m.kind || 'chat') === v ? ' selected' : '') + '>' + v + ' ─ ' + t + '</option>'; }).join('') +
     '</select></label>' +
     '<label class="f"><span>显示名</span><input id="m-label" value="' + esc(m.label || '') + '" placeholder="留空 = 用模型名"></label>' +

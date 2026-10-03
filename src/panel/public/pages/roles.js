@@ -5,6 +5,9 @@
  *     同时 ASR 根本没有"角色"可配（后端是「取第一个 kind=asr 的模型」）。
  *   - 现在：新增 asr 角色；下拉按模型类型过滤（对话角色只列 chat，asr 只列 asr）。
  *     服务端也会校验类型，填错直接拒。
+ * ⚠️ 2026-10-03 变更：新增记忆角色（embedding / rerank）——
+ *   配了 embedding 后记忆召回从「关键词」升级为「向量语义召回」，
+ *   再配 rerank 可以在候选精排一层。都不配 = 维持原有关键词召回，行为不变。
  */
 async function renderRoles(v) {
   const d = await api('/api/models');
@@ -14,10 +17,12 @@ async function renderRoles(v) {
   const kindOf = (m) => m.kind || 'chat';
   const chatMods = mods.filter((m) => kindOf(m) === 'chat');
   const asrMods = mods.filter((m) => kindOf(m) === 'asr');
+  const embMods = mods.filter((m) => kindOf(m) === 'embedding');
+  const rrkMods = mods.filter((m) => kindOf(m) === 'rerank');
 
   const rv = {};
   (d.resolved || []).forEach((x) => { rv[x.role] = x; });
-  const order = ['reply', 'main', 'sub', 'asr'];
+  const order = ['reply', 'main', 'sub', 'asr', 'embedding', 'rerank'];
   const resLine = order.some((k) => rv[k] && rv[k].model)
     ? '<div class="ev" style="margin-top:10px">当前生效：' + order
         .filter((k) => rv[k] && rv[k].model)
@@ -56,6 +61,18 @@ async function renderRoles(v) {
         : '<p class="hint" style="color:var(--warn)">还没有 asr 类型的模型。'
           + '去「模型与服务商」页新增一个，把<b>类型</b>选成 <b>asr</b>（比如 whisper 系的模型）。</p>') +
       '</div>' +
+    '<div class="card sec"><h3>记忆角色 → 模型</h3>' +
+      '<p class="hint">记忆召回的升级件：<b>embedding</b> 把「他说的话」和「每条记忆」都变成向量，按<b>语义相似度</b>召回'
+      + '（换一种说法也能命中，不再只靠关键词字面匹配）；<b>rerank</b> 再对粗筛出的候选精排一次，越相关越靠前。<br>'
+      + '<b>embedding 不配 = 维持原来的关键词召回</b>，什么都不坏。免费的可用组合：'
+      + '硅基流动 <span class="mono">BAAI/bge-m3</span> + <span class="mono">BAAI/bge-reranker-v2-m3</span>。</p>' +
+      roleRow('embedding', 'embedding · 记忆向量', '写入的记忆会后台补算向量并落库；换模型会自动重算旧向量。', embMods) +
+      roleRow('rerank', 'rerank · 召回精排', '可选。只在配了 embedding 之后生效。', rrkMods) +
+      (embMods.length
+        ? ''
+        : '<p class="hint" style="color:var(--warn)">还没有 embedding 类型的模型。'
+          + '去「模型与服务商」页新增一个，把<b>类型</b>选成 <b>embedding</b>（如 BAAI/bge-m3）。</p>') +
+      '</div>' +
     '<div class="card"><h3>上下文压缩</h3>' +
       '<p class="hint">超过“触发比例”就压到“目标比例”，保留最近若干轮原文。</p>' +
       '<div class="grid g3">' +
@@ -66,7 +83,10 @@ async function renderRoles(v) {
 
   $('#rl-save').addEventListener('click', async () => {
     const pick = (k) => { const e = $('#rl-' + k); return e ? e.value.trim() : ''; };
-    const r2 = await send('/api/roles', { reply: pick('reply'), main: pick('main'), sub: pick('sub'), asr: pick('asr') });
+    const r2 = await send('/api/roles', {
+      reply: pick('reply'), main: pick('main'), sub: pick('sub'),
+      asr: pick('asr'), embedding: pick('embedding'), rerank: pick('rerank'),
+    });
     toast(r2.ok ? '✓ 已保存' : '✗ ' + (r2.error || '失败'));
     if (r2.ok) { await refresh(); render(); }
   });

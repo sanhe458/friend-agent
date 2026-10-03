@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { contextBudget, maskKey, saveConfig, type McpServerConfig, type ModelDef } from '../config.ts';
+import { kindForRole } from '../models/registry.ts';
 import { withBuiltin } from '../reply/persona.ts';
 import { fetchModelMeta } from '../models/meta.ts';
 import { createMetasoSearch } from '../tools/metaso.ts';
@@ -224,6 +225,31 @@ const server = createServer(async (req, res) => {
       return json(res, 200, { personId, items: app.memory.all(personId) });
     }
 
+    /** 记忆语义召回自测：personId + query → 带分数/来源的召回结果（调试向量+重排链路用） */
+    if (req.method === 'GET' && p === '/api/memory/search') {
+      const personId = url.searchParams.get('personId') ?? '';
+      const query = (url.searchParams.get('query') ?? '').trim();
+      const k = Number(url.searchParams.get('k') ?? 8);
+      if (!personId || !query) return json(res, 400, { error: '缺 personId / query' });
+      const cfg = holder.current;
+      const eCfg = models.embedding();
+      const rCfg = models.rerank();
+      try {
+        const hits = await app.memory.probe(personId, query, Number.isFinite(k) && k > 0 ? k : 8);
+        return json(res, 200, {
+          personId,
+          query,
+          vectorRecall: Boolean(eCfg),
+          rerank: Boolean(rCfg),
+          embeddingModel: eCfg ? `${eCfg.provider.id}/${eCfg.model.model}` : '',
+          rerankModel: rCfg ? `${rCfg.provider.id}/${rCfg.model.model}` : '',
+          hits,
+        });
+      } catch (err) {
+        return json(res, 200, { personId, query, error: (err as Error).message, hits: [] });
+      }
+    }
+
     if (req.method === 'POST' && p === '/api/say') {
       const b = await readBody(req);
       if (!b.externalId) return json(res, 400, { error: '缺 externalId' });
@@ -357,12 +383,13 @@ const server = createServer(async (req, res) => {
         models: (c.models ?? []).map((m) => ({ ...m, budget: contextBudget(m.meta, c.compression) })),
         roles: c.roles ?? {},
         compression: c.compression,
-        resolved: (['reply', 'main', 'sub', 'asr'] as const).map((r) => {
-          // asr 走 models.asr()：没配角色时它还能退回「第一个 kind=asr 的模型」，这样显示的是**实际会用**的那个
-          const hit = r === 'asr' ? models.asr() : models.resolve(r);
+        resolved: (['reply', 'main', 'sub', 'asr', 'embedding', 'rerank'] as const).map((r) => {
+          // 功能类角色（asr/embedding/rerank）走各自的解析：没配角色时还能退回「第一个同类模型」，
+          // 这样显示的是**实际会用**的那个
+          const hit = r === 'asr' ? models.asr() : r === 'embedding' ? models.embedding() : r === 'rerank' ? models.rerank() : models.resolve(r);
           return {
             role: r,
-            id: r === 'asr' ? (hit?.model.id ?? '') : (c.roles?.[r] ?? ''),
+            id: hit?.model.id ?? (c.roles?.[r] ?? ''),
             provider: hit?.provider.id ?? '',
             model: hit?.model.model ?? '',
           };
@@ -468,7 +495,7 @@ const server = createServer(async (req, res) => {
       const id = String(b.id ?? '');
       const c = holder.current;
       const roles = { ...(c.roles ?? {}) };
-      for (const k of ['reply', 'main', 'sub'] as const) if (roles[k] === id) delete roles[k];
+      for (const k of ['reply', 'main', 'sub', 'asr', 'embedding', 'rerank'] as const) if (roles[k] === id) delete roles[k];
       holder.current = saveConfig({ models: (c.models ?? []).filter((m) => m.id !== id), roles });
       return json(res, 200, { ok: true });
     }
@@ -660,15 +687,15 @@ const server = createServer(async (req, res) => {
       const b = await readBody(req);
       const roles: Record<string, string> = {};
       const bad: string[] = [];
-      // ⚠️ 角色与模型类型必须对得上（三河 2026-10-02）：
-      //    对话角色(reply/main/sub) 只收 chat 模型；asr 只收 kind='asr' 的模型。
+      // ⚠️ 角色与模型类型必须对得上（三河 2026-10-02，2026-10-03 扩到记忆角色）：
+      //    对话角色(reply/main/sub) 只收 chat 模型；asr/embedding/rerank 一一对应。
       //    以前不校验，所以「对话角色」能选到 ASR 模型 —— 现在服务端也拦。
-      for (const k of ['reply', 'main', 'sub', 'asr'] as const) {
+      for (const k of ['reply', 'main', 'sub', 'asr', 'embedding', 'rerank'] as const) {
         const v = String(b[k] ?? '').trim();
         if (!v) continue;
         const m = models.model(v);
         if (!m) { bad.push(`${k} → 没有模型 ${v}`); continue; }
-        const want = k === 'asr' ? 'asr' : 'chat';
+        const want = kindForRole(k);
         const got = m.kind ?? 'chat';
         if (got !== want) {
           bad.push(`${k} 需要 ${want} 类型的模型，而「${v}」是 ${got}`);
@@ -687,14 +714,12 @@ const server = createServer(async (req, res) => {
       const m = models.model(String(b.modelId));
       if (!m) return json(res, 200, { ok: false, error: '没有这个模型' });
       const kind = m.kind ?? 'chat';
-      // 非对话模型不能用 chatCompletion 测，否则报一堆看不懂的错
-      if (kind !== 'chat') {
+      // ASR 没法用文本探活（要真的发音频）；embedding/rerank 在 registry.test 里有各的真打法
+      if (kind === 'asr') {
         return json(res, 200, {
           ok: true,
           ms: 0,
-          note: kind === 'asr'
-            ? '这是 ASR（语音转文字）模型，用对话方式测不了 —— 发一条语音给它才是真测。'
-            : `这是 ${kind} 类型的模型，不能用对话方式测。`,
+          note: '这是 ASR（语音转文字）模型，用对话方式测不了 —— 发一条语音给它才是真测。',
         });
       }
       try {

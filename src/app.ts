@@ -89,11 +89,24 @@ export function createApp(opts: {
   const persist = createSqlitePersistence(getConfig().dbPath ?? DB_PATH);
 
   const identity = new IdentityService(persist);
-  const memory = new MemoryStore(persist);
+  // ⚠️ models 必须先于 memory 声明：MemoryStore 构造时会做向量 backfill，
+  //    立即调用这里的 embedding()/rerank()（晚一行就是 TDZ ReferenceError）
+  const models = opts.models ?? new ModelRegistry(getConfig);
+  // 记忆的语义召回依赖模型注册表：每次用时现取（跟着配置热重载走），
+  // 没配 embedding 模型 = 维持老的关键词召回，行为不变
+  const memory = new MemoryStore(persist, {
+    embedding: () => {
+      const e = models.embedding();
+      return e ? { baseUrl: e.provider.baseUrl, apiKey: e.provider.apiKey, model: e.model.model } : undefined;
+    },
+    rerank: () => {
+      const r = models.rerank();
+      return r ? { baseUrl: r.provider.baseUrl, apiKey: r.provider.apiKey, model: r.model.model } : undefined;
+    },
+  });
   const queue = new PersonQueue();
   const bus = new Bus();
   const tools = new ToolRegistry();
-  const models = opts.models ?? new ModelRegistry(getConfig);
   const search = opts.search ?? createMetasoSearch(getConfig());
 
   // 日志要先于引擎建好：引擎的 notice 要写进来

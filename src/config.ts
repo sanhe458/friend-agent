@@ -40,16 +40,15 @@ export interface ModelMeta {
 }
 
 /**
- * 模型类型。现在只用到 chat / asr，但**先把类型位留好**：
- * 以后加 tts（文字转语音）/ vision / embedding 只需往这个联合类型里加一个词，
- * 不会到处改结构。
- * - chat  对话/推理（默认）
- * - asr   语音转文字（用户发语音时用）
- * - tts   文字转语音
- * - vision 图像理解
- * - embedding 向量
+ * 模型类型。
+ * - chat      对话/推理（默认）
+ * - asr       语音转文字
+ * - tts       文字转语音（预留）
+ * - vision    图像理解（预留）
+ * - embedding 向量：记忆语义召回用
+ * - rerank    重排序：记忆召回的精排段用
  */
-export type ModelKind = 'chat' | 'asr' | 'tts' | 'vision' | 'embedding';
+export type ModelKind = 'chat' | 'asr' | 'tts' | 'vision' | 'embedding' | 'rerank';
 
 export interface ModelDef {
   /** 唯一键，角色引用的是它 */
@@ -98,6 +97,13 @@ export interface Roles {
    * 只有 kind='asr' 的模型能填这里；对话角色(reply/main/sub)也只应填 chat 模型。
    */
   asr?: string;
+  /**
+   * 记忆语义召回用的嵌入模型（kind='embedding'）。
+   * 配了之后记忆 recall 走「向量召回 + 重排」；不配 = 维持原来的关键词召回。
+   */
+  embedding?: string;
+  /** 记忆召回的精排模型（kind='rerank'）。可选：只有配了 embedding 才有用武之地 */
+  rerank?: string;
 }
 
 /** 官方 QQ 机器人通道配置 */

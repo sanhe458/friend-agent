@@ -137,8 +137,8 @@ export class ReplyEngine {
 
     this.#emit(person.id, { kind: 'user', at: Date.now(), channel: msg.channel, text }, false);
 
-    // 自动召回：不靠模型主动调，每轮先注入 top-k
-    const recalled = this.#memory.recall(person.id, text, 4);
+    // 自动召回：不靠模型主动调，每轮先注入 top-k（配了嵌入模型走语义召回，失败自动退关键词）
+    const recalled = await this.#memory.recall(person.id, text, 4);
 
     const hit = this.#models?.resolve('reply');
     if (!hit) return this.#ruleBased(person, msg, text, recalled, injections, boundary);

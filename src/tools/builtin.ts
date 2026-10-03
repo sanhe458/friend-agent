@@ -57,8 +57,8 @@ export function registerBuiltinTools(
     name: 'memory_recall',
     description: '补查这个人的记忆（自动召回之外）',
     schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
-    timeoutMs: 300,
-    run: async (args: { query: string }, ctx) => memory.recall(ctx.personId, args.query, 5).map((h) => h.text),
+    timeoutMs: 30_000,
+    run: async (args: { query: string }, ctx) => (await memory.recall(ctx.personId, args.query, 5)).map((h) => h.text),
   });
 
   reg.register({

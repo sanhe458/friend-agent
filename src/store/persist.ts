@@ -38,7 +38,10 @@ export interface Persistence {
   deletePerson(id: string): void;
 
   loadMemories(): Array<{ personId: string; item: MemoryItem }>;
-  saveMemory(personId: string, item: MemoryItem): void;
+  /** 落一条记忆，返回库里的自增 id（后台补算向量时用它 UPDATE） */
+  saveMemory(personId: string, item: MemoryItem): number;
+  /** 记忆的嵌入向量算好后补写（换模型重算也走这里） */
+  saveMemoryVec(id: number, vec: Float32Array, model: string): void;
 
   loadHistory(personId: string, limit?: number): ChatMessage[];
   saveHistory(personId: string, msg: ChatMessage): void;
@@ -80,7 +83,9 @@ create table if not exists memories (
   tags text not null default '',
   channel text not null default '',
   at integer not null,
-  hot integer not null default 1
+  hot integer not null default 1,
+  vec blob,
+  vec_model text
 );
 create index if not exists idx_memories_person on memories(person_id, id);
 create table if not exists history (
@@ -137,7 +142,8 @@ export function createNullPersistence(): Persistence {
     savePerson: () => {},
     deletePerson: () => {},
     loadMemories: () => [],
-    saveMemory: () => {},
+    saveMemory: () => 0,
+    saveMemoryVec: () => {},
     loadHistory: () => [],
     saveHistory: () => {},
     loadEvents: () => [],
@@ -159,6 +165,9 @@ export function createSqlitePersistence(file: string): Persistence {
   db.exec(SCHEMA);
   // 轻量迁移：老库的 persons 没有 persona_id 列（已存在时报错，忽略）
   try { db.exec('alter table persons add column persona_id text'); } catch { /* 已有 */ }
+  // 轻量迁移：老库的 memories 没有向量列（记忆语义召回，2026-10-03）
+  try { db.exec('alter table memories add column vec blob'); } catch { /* 已有 */ }
+  try { db.exec('alter table memories add column vec_model text'); } catch { /* 已有 */ }
 
   const q = {
     upsertPerson: db.prepare(
@@ -189,10 +198,11 @@ export function createSqlitePersistence(file: string): Persistence {
     allPersons: db.prepare('select id, display_name, preferred_channel, persona_id, created_at from persons'),
     allBindings: db.prepare('select channel, external_id, person_id, verified_at, display_name from bindings'),
 
-    allMemories: db.prepare('select person_id, text, tags, channel, at, hot from memories order by id'),
+    allMemories: db.prepare('select id, person_id, text, tags, channel, at, hot, vec, vec_model from memories order by id'),
     insMemory: db.prepare(
       'insert into memories (person_id, text, tags, channel, at, hot) values (?, ?, ?, ?, ?, ?)',
     ),
+    updMemoryVec: db.prepare('update memories set vec = ?, vec_model = ? where id = ?'),
 
     hist: db.prepare(
       'select role, content, tool_calls, at from history where person_id = ? order by id desc limit ?',
@@ -283,21 +293,44 @@ export function createSqlitePersistence(file: string): Persistence {
       q.delPersonEvts.run(id);
     },
 
-    loadMemories() {
-      return (q.allMemories.all() as any[]).map((r) => ({
-        personId: String(r.person_id),
-        item: {
-          text: String(r.text),
-          tags: String(r.tags ?? '').split(',').filter(Boolean),
-          channel: String(r.channel ?? ''),
-          at: Number(r.at),
-          hot: Number(r.hot) === 1,
-        } as MemoryItem,
-      }));
+    loadMemories(): Array<{ personId: string; item: MemoryItem }> {
+      return (q.allMemories.all() as any[]).map((r) => {
+        // 向量列：BLOB → Float32Array。
+        // ⚠️ node:sqlite 读出的 BLOB 是 Uint8Array（有的版本是 Buffer，它是 Uint8Array 的子类）
+        //    ——只认 Buffer 的话向量永远恢复不出来，重开后全量退回关键词（实测踩过）。
+        let vec: Float32Array | undefined;
+        if (r.vec instanceof Uint8Array && r.vec.byteLength >= 4) {
+          try {
+            const copy = new Uint8Array(r.vec.byteLength);
+            copy.set(r.vec);
+            vec = new Float32Array(copy.buffer);
+          } catch { vec = undefined; }
+        }
+        return {
+          personId: String(r.person_id),
+          item: {
+            id: Number(r.id),
+            text: String(r.text),
+            tags: String(r.tags ?? '').split(',').filter(Boolean),
+            channel: String(r.channel ?? ''),
+            at: Number(r.at),
+            hot: Number(r.hot) === 1,
+            ...(vec ? { vec } : {}),
+            ...(r.vec_model ? { vecModel: String(r.vec_model) } : {}),
+          } as MemoryItem,
+        };
+      });
     },
 
-    saveMemory(personId: string, item: MemoryItem): void {
-      q.insMemory.run(personId, item.text, item.tags.join(','), item.channel, item.at, item.hot ? 1 : 0);
+    saveMemory(personId: string, item: MemoryItem): number {
+      const r = q.insMemory.run(personId, item.text, item.tags.join(','), item.channel, item.at, item.hot ? 1 : 0);
+      return Number(r.lastInsertRowid);
+    },
+
+    saveMemoryVec(id: number, vec: Float32Array, model: string): void {
+      // Float32Array → Buffer（拷贝一份，别共享底层 buffer）
+      const blob = Buffer.from(new Uint8Array(vec.buffer, vec.byteOffset, vec.byteLength));
+      q.updMemoryVec.run(blob, model, id);
     },
 
     loadHistory(personId: string, limit = 60): ChatMessage[] {
