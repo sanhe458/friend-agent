@@ -49,7 +49,12 @@ async function renderMcp(v) {
       '<label class="f"><span>ID（唯一键' + (existing ? '，不可改' : '') + '）</span><input id="ms-id" value="' + esc(s.id || '') + '"' + (existing ? ' readonly' : '') + ' placeholder="filesystem"></label>' +
       '<label class="f"><span>启动命令（stdio）或 MCP 端点 URL（http/https）</span><input id="ms-cmd" value="' + esc(s.command || '') + '" placeholder="npx … 或 https://mcp.example.com/mcp"></label>' +
       '<label class="f"><span>HTTP 请求头（可选，JSON，如 {"Authorization":"Bearer xx"}）</span><input id="ms-headers" value="' + esc(s.headers ? JSON.stringify(s.headers) : '') + '" placeholder=\'{"Authorization":"Bearer …"}\'></label>' +
-      '<label class="f"><span>参数（空格分隔）</span><input id="ms-args" value="' + esc((s.args || []).join(' ')) + '" placeholder="-y @modelcontextprotocol/server-filesystem /tmp"></label>' +
+      '<label class="f"><span>HTTP 传输方式</span><select id="ms-transport" style="width:100%">' +
+        '<option value="">自动探测（先 Streamable HTTP，失败退 SSE）</option>' +
+        '<option value="http"' + (s.transport === 'http' ? ' selected' : '') + '>Streamable HTTP（新协议）</option>' +
+        '<option value="sse"' + (s.transport === 'sse' ? ' selected' : '') + '>HTTP+SSE（旧协议 2024-11）</option>' +
+      '</select></label>' +
+      '<label class="f"><span>参数（空格分隔，仅本地命令用）</span><input id="ms-args" value="' + esc((s.args || []).join(' ')) + '" placeholder="-y @modelcontextprotocol/server-filesystem /tmp"></label>' +
       '<label class="f"><span>工作目录（可选）</span><input id="ms-cwd" value="' + esc(s.cwd || '') + '"></label>' +
       '<label class="f"><span>给谁用</span><span class="row" style="gap:18px">' +
         '<label class="row" style="gap:6px;margin:0"><input type="checkbox" id="ms-aud-reply" style="width:auto"' + (aud.includes('reply') ? ' checked' : '') + '> 回复模型</label>' +
@@ -73,6 +78,8 @@ async function renderMcp(v) {
           const h = $('#ms-headers').value.trim();
           if (h) entry.headers = JSON.parse(h); // 写错 JSON 直接拦下，别存坏配置
         } catch { toast('✗ 请求头不是合法 JSON'); return false; }
+        const tp = $('#ms-transport').value;
+        if (tp) entry.transport = tp; // 留空 = 自动探测（先 Streamable，失败退 SSE）
         const cwd = $('#ms-cwd').value.trim();
         if (cwd) entry.cwd = cwd;
         await saveAll(others.concat([entry]));

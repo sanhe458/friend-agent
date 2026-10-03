@@ -500,6 +500,7 @@ const server = createServer(async (req, res) => {
           command,
           // HTTP 传输：显式 url 字段，或 command 直接填 https://…
           ...(s.url && String(s.url).trim() ? { url: String(s.url).trim() } : {}),
+          ...(s.transport === 'sse' || s.transport === 'http' ? { transport: s.transport } : {}),
           ...(s.headers && typeof s.headers === 'object' && Object.keys(s.headers).length
             ? { headers: Object.fromEntries(Object.entries(s.headers as Record<string, unknown>).map(([k, v]) => [k, String(v)])) } : {}),
           ...(Array.isArray(s.args) && s.args.length ? { args: (s.args as unknown[]).map(String) } : {}),

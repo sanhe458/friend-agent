@@ -47,6 +47,8 @@ export interface McpServerConfig {
   enabled?: boolean;
   /** 给谁用：'reply' / 'sub'，都勾 = 都能用。默认都给 */
   audience?: Array<'reply' | 'sub'>;
+  /** 强制指定传输：'http' = Streamable HTTP；'sse' = 旧版 HTTP+SSE。不填 = URL 自动探测（先 http 后 sse） */
+  transport?: 'http' | 'sse';
   /** 每次工具调用的超时（默认 30s） */
   timeoutMs?: number;
 }
@@ -85,17 +87,27 @@ class McpConnection {
   readonly id: string;
   readonly cfg: McpServerConfig;
   lastError = '';
-  /** 传输方式：command/url 是 URL → 'http'（Streamable HTTP），否则 stdio 子进程 */
-  readonly mode: 'stdio' | 'http';
+  /** 传输方式：URL → 自动探测（先 Streamable HTTP，不行退 HTTP+SSE）；否则 stdio */
+  readonly mode: 'stdio' | 'http' | 'sse';
   #url?: string;
   #sessionId?: string;
   #httpUp = false;
+  /** 没显式给 transport 时，连接时自动探测 */
+  #autoDetect = false;
+  /** McpManager 能读：未显式指定 transport 时，Streamable 失败可退 SSE */
+  get autoDetect(): boolean { return this.#autoDetect; }
+  // ── SSE（2024-11 旧协议）专用 ──
+  #ssePostUrl?: string;   // 服务器在 endpoint 事件里告知的 POST 地址
+  #sseAbort?: AbortController;
+  #sseWaiters = new Map<number, (m: RpcMsg) => void>(); // 等 SSE 流里回来响应的等待者
 
   constructor(cfg: McpServerConfig) {
     this.cfg = cfg;
     this.id = cfg.id;
     this.#url = cfg.url ?? (isHttpUrl(cfg.command) ? cfg.command : undefined);
-    this.mode = this.#url ? 'http' : 'stdio';
+    // transport 显式指定优先；URL 默认先走 Streamable HTTP，失败自动退 SSE（#autoDetect）
+    this.mode = this.#url ? (cfg.transport === 'sse' ? 'sse' : 'http') : 'stdio';
+    this.#autoDetect = Boolean(this.#url) && !cfg.transport;
   }
 
   get connected(): boolean {
@@ -107,6 +119,20 @@ class McpConnection {
     if (this.connected) return;
     this.#waits.clear();
     this.#buf = '';
+
+    // ── HTTP+SSE（2024-11 旧协议）──
+    if (this.mode === 'sse') {
+      await this.#sseConnect();
+      const init = await this.#request('initialize', {
+        protocolVersion: PROTOCOL_VERSION,
+        capabilities: {},
+        clientInfo: { name: 'friend-agent', version: '1.0.0' },
+      }, 15_000);
+      if (!init || (init as any).error) throw new Error(`initialize 失败：${(init as any)?.error?.message ?? '无响应'}`);
+      this.#httpUp = true;
+      void this.#notify('notifications/initialized');
+      return;
+    }
 
     // ── HTTP（Streamable HTTP / MCP-over-HTTP）──
     if (this.mode === 'http') {
@@ -185,6 +211,7 @@ class McpConnection {
 
   #request(method: string, params: unknown, timeoutMs: number): Promise<RpcMsg> {
     if (this.mode === 'http') return this.#httpRpc(method, params, timeoutMs);
+    if (this.mode === 'sse') return this.#sseRpc(method, params, timeoutMs);
     const id = ++this.#seq;
     return new Promise((resolve) => {
       this.#waits.set(id, resolve);
@@ -206,6 +233,98 @@ class McpConnection {
       return;
     }
     this.#write({ jsonrpc: '2.0', method, params });
+  }
+
+  /** HTTP+SSE：挂 GET /sse 长连接，等 endpoint 事件告知 POST 地址 */
+  async #sseConnect(): Promise<void> {
+    this.#sseAbort = new AbortController();
+    const base = new URL(this.#url!);
+    const headers: Record<string, string> = { Accept: 'text/event-stream', ...(this.cfg.headers ?? {}) };
+    const res = await fetch(base, { method: 'GET', headers, signal: this.#sseAbort.signal });
+    if (!res.ok || !res.body) throw new Error(`SSE 连接失败：HTTP ${res.status}`);
+
+    // endpoint 事件到来之前没法发请求 → 等它（最多 10s）
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('SSE 服务器 10s 内没发 endpoint 事件')), 10_000);
+      timer.unref?.();
+      const reader = res.body!.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      const pump = async () => {
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            let idx: number;
+            while ((idx = buf.indexOf('\n')) !== -1) {
+              const line = buf.slice(0, idx).trim();
+              buf = buf.slice(idx + 1);
+              if (!line.startsWith('data:')) continue;
+              const payload = line.slice(5).trim();
+              // ① endpoint 事件：POST 地址（第一次出现）
+              if (!this.#ssePostUrl && (payload.startsWith('{') === false)) {
+                this.#ssePostUrl = new URL(payload, base).toString();
+                clearTimeout(timer); resolve();
+                continue;
+              }
+              // ② JSON-RPC 消息：响应分发给等待者
+              let m: RpcMsg | null = null;
+              try { m = JSON.parse(payload) as RpcMsg; } catch { /* ignore */ }
+              if (!m) continue;
+              if (m.id !== undefined && this.#sseWaiters.has(Number(m.id))) {
+                this.#sseWaiters.get(Number(m.id))!(m);
+                this.#sseWaiters.delete(Number(m.id));
+              } else if (m.method) {
+                this.#onMsg(m);
+              }
+            }
+          }
+        } catch { /* 流断或被 abort：stop() 兼底，不算错 */ }
+      };
+      void pump();
+      this.#sseAbort!.signal.addEventListener('abort', () => {
+        clearTimeout(timer);
+        // reader.cancel() 返回 promise，拒绝会变成 unhandled rejection —— 必须接住
+        reader.cancel().catch(() => {});
+      });
+    });
+  }
+
+  /** HTTP+SSE 上的一次请求：POST 到 endpoint，响应从 GET 的 SSE 流里按 id 回来 */
+  async #sseRpc(method: string, params: unknown, timeoutMs: number): Promise<RpcMsg> {
+    if (!this.#ssePostUrl) return { jsonrpc: '2.0', error: { code: -7, message: 'SSE 未就绪（没拿到 endpoint）' } };
+    const id = ++this.#seq;
+    const p = new Promise<RpcMsg>((resolve) => {
+      this.#sseWaiters.set(id, resolve);
+      const timer = setTimeout(() => {
+        if (this.#sseWaiters.has(id)) {
+          this.#sseWaiters.delete(id);
+          resolve({ jsonrpc: '2.0', error: { code: -2, message: `SSE 请求超时（${timeoutMs}ms）` } });
+        }
+      }, timeoutMs);
+      timer.unref?.();
+    });
+    try {
+      const res = await fetch(this.#ssePostUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(this.cfg.headers ?? {}) },
+        body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok && res.status !== 202) {
+        const t = await res.text().catch(() => '');
+        this.#sseWaiters.delete(id);
+        if (res.status === 404) this.#httpUp = false;
+        return { jsonrpc: '2.0', error: { code: -4, message: `HTTP ${res.status} ${t.slice(0, 160)}` } };
+      }
+      // 202 = 已接受，响应从 SSE 流回（等待者已在 map 里）
+    } catch (err) {
+      this.#sseWaiters.delete(id);
+      this.#httpUp = false;
+      return { jsonrpc: '2.0', error: { code: -6, message: `SSE POST 失败：${(err as Error).message}` } };
+    }
+    return p;
   }
 
   /** HTTP POST 一条 JSON-RPC 消息；返回解析出的全部消息（单 JSON 或 SSE 流） */
@@ -295,6 +414,15 @@ class McpConnection {
   }
 
   stop(): void {
+    if (this.mode === 'sse') {
+      try { this.#sseAbort?.abort(); } catch { /* ignore */ }
+      this.#sseAbort = undefined;
+      this.#ssePostUrl = undefined;
+      this.#httpUp = false;
+      for (const w of this.#sseWaiters.values()) w({ jsonrpc: '2.0', error: { code: -1, message: '已关闭' } });
+      this.#sseWaiters.clear();
+      return;
+    }
     if (this.mode === 'http') {
       // 优雅关闭：Streamable HTTP 用 DELETE 结束会话（尽力而为）
       if (this.#sessionId && this.#url) {
@@ -350,8 +478,22 @@ export class McpManager {
         try {
           await conn.start();
           await this.attach(conn);
-          this.#log(`[mcp] ${cfg.id} 已连接，挂载 ${await this.countTools(conn)} 个工具（audience=${JSON.stringify(cfg.audience ?? ['reply', 'sub'])}）`);
+          this.#log(`[mcp] ${cfg.id} 已连接（${conn.mode}），挂载 ${await this.countTools(conn)} 个工具（audience=${JSON.stringify(cfg.audience ?? ['reply', 'sub'])}）`);
         } catch (err) {
+          // 自动探测：Streamable HTTP 握手失败 → 退到旧版 HTTP+SSE 再试一次（2024-11 协议还有一堆服务器在用）
+          if (conn.autoDetect && conn.mode === 'http') {
+            this.detach(cfg.id); conn.stop(); this.#conns.delete(cfg.id);
+            const alt = new McpConnection({ ...cfg, transport: 'sse' });
+            this.#conns.set(cfg.id, alt);
+            try {
+              await alt.start();
+              await this.attach(alt);
+              this.#log(`[mcp] ${cfg.id} Streamable HTTP 不通，已退到 HTTP+SSE，挂载 ${await this.countTools(alt)} 个工具`);
+              continue;
+            } catch (err2) {
+              this.#log(`[mcp] ${cfg.id} SSE 也不通：${(err2 as Error).message}`);
+            }
+          }
           this.#log(`[mcp] ${cfg.id} 连接失败：${(err as Error).message}`);
         }
       }
