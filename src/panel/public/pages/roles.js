@@ -11,6 +11,7 @@
  */
 async function renderRoles(v) {
   const d = await api('/api/models');
+  if (TAB !== 'roles' || v !== document.getElementById('view')) return; // await 期间切走了
   const r = d.roles || {};
   const c = d.compression || {};
   const mods = d.models || [];

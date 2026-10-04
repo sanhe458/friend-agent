@@ -113,6 +113,20 @@ export class MemoryStore {
   }
 
   /**
+   * 删一条记忆（面板「删除」按钮走这里）。
+   * ⚠️ personId + id 双重约束：id 是全局自增，带上 personId 才不会误删别人的分片。
+   * 向量没落库的内存条目（id 还没回填）按对象引用删。
+   */
+  forget(personId: string, id: number): boolean {
+    const list = this.#byPerson.get(personId) ?? [];
+    const i = list.findIndex((it) => it.id === id);
+    if (i < 0) return false;
+    list.splice(i, 1);
+    this.#byPerson.set(personId, list);
+    return this.#persist?.deleteMemory(personId, id) ?? true;
+  }
+
+  /**
    * 自动召回：语义（向量 + 重排）优先，任何一步不可用/失败退回关键词打分。
    */
   async recall(personId: string, query: string, k = 5): Promise<MemoryItem[]> {

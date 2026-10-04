@@ -514,11 +514,13 @@ export class McpManager {
     }
   }
 
-  status(): Array<{ id: string; connected: boolean; tools: number; audience: string[]; lastError?: string }> {
+  status(): Array<{ id: string; connected: boolean; tools: number; audience: string[]; toolNames: string[]; lastError?: string }> {
     return [...this.#conns.values()].map((c) => ({
       id: c.id,
       connected: c.connected,
       tools: this.listToolsOf(c.id).length,
+      // 工具名列表：面板展开可以看每台服务器到底挂了什么（名字已含 mcp_服务器_ 前缀）
+      toolNames: this.listToolsOf(c.id).map((t) => t.name),
       audience: c.cfg.audience ?? ['reply', 'sub'],
       ...(c.lastError ? { lastError: c.lastError } : {}),
     }));

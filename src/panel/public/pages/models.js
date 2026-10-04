@@ -9,6 +9,7 @@
  */
 async function renderModels(v) {
   const d = await api('/api/models');
+  if (TAB !== 'models' || v !== document.getElementById('view')) return; // await 期间切走了
   if (d.error) { v.innerHTML = '<div class="empty">读取失败</div>'; return; }
   const provs = d.providers || [], mods = d.models || [];
 

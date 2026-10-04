@@ -1,7 +1,7 @@
 /* 页面：personas（人格预设） */
 async function renderPersonas(v) {
   const d = await api('/api/personas');
-  if (v !== document.getElementById('view')) return;
+  if (TAB !== 'personas' || v !== document.getElementById('view')) return;
   const list = d.personas || [];
   const def = d.defaultPersonaId || 'xiaoman';
   const ppl = (ST.state.persons || []);

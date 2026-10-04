@@ -1,22 +1,28 @@
-/* 页面：overview */
+/* 页面：overview
+ * 2026-10-04 升级：8 个指标 tiles（补记忆/定时/MCP）、快捷操作、人员速览卡。
+ *   以前的「运行时长 1847m」换算成天/小时；最近动态可以一键跳日志页。
+ */
 function renderOverview(v) {
   const rt = ST.runtime || {}, st = ST.state || {};
-  const persons = (st.persons || []).length;
-  const chans = (rt.channels || []).length;
-  const tasks = (st.tasks || []).length;
-  const running = (st.tasks || []).filter((x) => x.status === 'running').length;
+  const persons = st.persons || [];
+  const tasks = st.tasks || [];
+  const running = tasks.filter((x) => x.status === 'running').length;
   const qq = (ST.qq && ST.qq.status) || {};
-  const up = Math.floor((rt.uptimeMs || 0) / 1000);
+  const jobs = st.jobs || { total: 0, enabled: 0 };
+  const mcp = st.mcp || { servers: 0, connected: 0, tools: 0 };
+  const memories = st.counts ? st.counts.memories : 0;
   const tiles = [
-    ['运行时长', Math.floor(up / 60) + 'm' + (up % 60) + 's', 'pid ' + (rt.pid || '—')],
-    ['人数', String(persons), '独立人格记忆'],
-    ['通道', String(chans), (rt.channels || []).join(' · ') || '—'],
-    ['任务', String(tasks), running ? running + ' 个在跑' : '全部结束'],
+    ['运行时长', fmtUptime(rt.uptimeMs || 0), 'pid ' + (rt.pid || '—')],
+    ['人数', String(persons.length), persons.length ? '共 ' + memories + ' 条记忆' : '还没有人'],
+    ['记忆', String(memories), persons.length ? '按人分片 · 语义召回' : '按人分片存储'],
+    ['任务', String(tasks.length), running ? running + ' 个在跑' : '全部结束'],
+    ['定时任务', jobs.total ? jobs.enabled + ' / ' + jobs.total : '0', jobs.enabled ? '启用中' : '没有启用中的'],
+    ['MCP', mcp.servers ? mcp.connected + ' / ' + mcp.servers : '0', mcp.tools ? '挂载 ' + mcp.tools + ' 个工具' : '未配置服务器'],
     ['工具', String(rt.tools || 0), '可被调用'],
-    ['热重载', String(rt.reloadCount || 0) + ' 次', rt.watching ? '监听中' : '未监听']
+    ['热重载', String(rt.reloadCount || 0) + ' 次', rt.watching ? '监听配置中' : '未监听'],
   ];
   v.innerHTML =
-    '<div class="grid g3 sec">' + tiles.map((x) =>
+    '<div class="grid g4 sec">' + tiles.map((x) =>
       '<div class="tile"><div class="k">' + esc(x[0]) + '</div><div class="v num">' + esc(x[1]) + '</div><div class="d">' + esc(x[2]) + '</div></div>'
     ).join('') + '</div>' +
     '<div class="grid g2 sec">' +
@@ -33,31 +39,47 @@ function renderOverview(v) {
         '<button class="btn sm" id="ov-check">检查连通性</button></div>' +
       '</div>' +
       '<div class="card"><h3>最近动态</h3>' +
-        ((st.log || []).slice(-7).reverse().map((e) =>
+        '<div id="ov-feed">' +
+        ((st.log || []).slice(-8).reverse().map((e) =>
           '<div class="ev"><span class="n">' + (e.dir === 'in' ? '←' : e.dir === 'out' ? '→' : '·') + '</span> ' +
-          esc(String(e.text || '').slice(0, 90)) + '</div>').join('') || '<div class="empty">暂无</div>') +
+          '<span style="color:var(--ink3);font-size:10.5px">' + fmtTime(e.at) + '</span> ' +
+          esc(String(e.text || '').slice(0, 80)) + '</div>').join('') || '<div class="empty">暂无</div>') +
+        '</div>' +
+        '<div class="row" style="margin-top:10px"><button class="btn sm" id="ov-logs">全部日志 →</button></div>' +
       '</div>' +
     '</div>' +
-    '<div class="card pad0"><h3 style="padding:16px 18px 0">通道清单</h3>' +
-      '<table class="plain"><thead><tr><th>通道</th><th>类型</th><th>入站</th><th>出站</th><th>“正在输入”</th></tr></thead><tbody>' +
-      (rt.channelInfo || (rt.channels || []).map((id) => ({ id, kind: 'mock', typing: false }))).map((c) => {
-        // ⚠️ 以前是硬编码 `c === 'qq' && rt.qqMounted` —— Telegram 明明配好且在跑，也永远显示「占位」。
-        //    现在每个适配器自报 kind，面板照实渲染。
-        const isReal = c.kind === 'real';
-        const off = c.id === 'qq' && !qq.online; // 只有 QQ 有显式的在线状态
-        const typing = !c.typing
-          ? '—'
-          : (off ? '<span class="tag">离线</span>' : '<span class="tag on">可用</span>');
-        return '<tr><td><b>' + esc(c.id) + '</b></td>' +
-          '<td>' + (isReal ? '真实' : '<span style="color:var(--ink3)">占位</span>') + '</td>' +
-          '<td>' + (isReal ? '真实推送' : '模拟') + '</td>' +
-          '<td>' + (isReal ? '真实 API' : '内存') + '</td>' +
-          '<td>' + typing + '</td></tr>';
-      }).join('') + '</tbody></table></div>';
-  const b1 = $('#ov-qq'); if (b1) b1.addEventListener('click', () => go('channels'));
-  const b2 = $('#ov-check'); if (b2) b2.addEventListener('click', async () => { toast('检查中…'); const r = await send('/api/qq/check'); toast(r.ok ? '✓ ' + r.note : '✗ ' + r.note); });
+    '<div class="card sec"><div class="row"><h3 style="margin:0">快捷操作</h3><span class="spacer"></span>' +
+      '<button class="btn sm pri" data-quick="chat">去对话</button>' +
+      '<button class="btn sm" data-quick="memory">新增记忆</button>' +
+      '<button class="btn sm" data-quick="scheduled">新建定时</button>' +
+      '<button class="btn sm" data-quick="palette">快速跳转 · Ctrl K</button>' +
+    '</div></div>' +
+    '<div class="card pad0"><div class="row" style="padding:16px 18px 12px"><h3 style="margin:0">人员速览</h3>' +
+      '<span class="spacer"></span><button class="btn sm" data-quick="persons">管理 →</button></div>' +
+      (persons.length
+        ? '<div class="grid g3" style="padding:0 18px 18px">' + persons.slice(0, 9).map((p) => {
+            const b0 = (p.bindings || [])[0] || {};
+            return '<div class="card" style="padding:13px 15px;cursor:pointer" data-person-go="' + esc(b0.channel + '|' + b0.externalId) + '" title="点开和 ' + esc(p.displayName || p.id) + ' 的对话">' +
+              '<div class="row"><b>' + esc(p.displayName || p.id) + '</b><span class="spacer"></span><span class="tag">' + ((ST.memCount || {})[p.id] || 0) + ' 条记忆</span></div>' +
+              '<div style="color:var(--ink3);font-size:12px;margin-top:5px">' +
+                esc((p.bindings || []).map((b) => b.channel + ':' + String(b.externalId).slice(0, 14)).join(' · ') || '无绑定') +
+              '</div></div>';
+          }).join('') + (persons.length > 9 ? '<div class="empty" style="grid-column:1/-1;padding:10px">还有 ' + (persons.length - 9) + ' 个人 → 去「人 / 身份」查看</div>' : '') + '</div>'
+        : '<div class="empty">还没有识别到任何人。在对话里说一句话（面板对话页 / QQ / Telegram），就会自动建档。</div>') +
+    '</div>';
+  $('#ov-qq').addEventListener('click', () => go('channels'));
+  $('#ov-check').addEventListener('click', async () => { toast('检查中…'); const r = await send('/api/qq/check'); toast(r.ok ? '✓ ' + r.note : '✗ ' + r.note, r.ok ? 'ok' : 'err'); });
+  $('#ov-logs').addEventListener('click', () => go('logs'));
+  $$('[data-quick]').forEach((b) => b.addEventListener('click', () => {
+    const t = b.getAttribute('data-quick');
+    if (t === 'palette') return paletteOpen();
+    go(t);
+  }));
+  $$('[data-person-go]').forEach((el) => el.addEventListener('click', () => {
+    const val = el.getAttribute('data-person-go');
+    try { sessionStorage.setItem('fa_chat_pick', JSON.stringify({ channel: val.split('|')[0], externalId: val.split('|')[1] })); } catch { /* ignore */ }
+    go('chat');
+  }));
 }
-
-/* ── 运行时 ───────────────────────────── */
 
 PAGES['overview'] = { render: renderOverview };

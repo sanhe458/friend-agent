@@ -22,6 +22,7 @@ async function renderMcp(v) {
           servers.map((s) => {
             const st = status[s.id] || {};
             const ok = st.connected === true;
+            const names = st.toolNames || [];
             return '<tr><td><b>' + esc(s.id) + '</b></td>' +
               '<td class="mono" style="font-size:12px">' + esc([s.command].concat(s.args || []).join(' ').slice(0, 52)) + '</td>' +
               '<td>' + (s.enabled === false
@@ -30,6 +31,7 @@ async function renderMcp(v) {
                      : '<span class="tag warn">断开</span><div class="hint" style="margin:0">' + esc(String(st.lastError || '').slice(0, 40)) + '</div>')) + '</td>' +
               '<td>' + esc(audTxt(s.audience)) + '</td>' +
               '<td class="row"><button class="btn sm" data-act="edit" data-id="' + esc(s.id) + '">编辑</button>' +
+              '<button class="btn sm" data-act="tools" data-id="' + esc(s.id) + '"' + (names.length ? '' : ' disabled title="没有已挂载的工具"') + '>工具</button>' +
               '<button class="btn sm" data-act="reconnect" data-id="' + esc(s.id) + '">重连</button>' +
               '<button class="btn sm danger" data-act="del" data-id="' + esc(s.id) + '">删除</button></td></tr>';
           }).join('') + '</tbody></table>'
@@ -91,6 +93,19 @@ async function renderMcp(v) {
     const act = b.getAttribute('data-act');
     const id = b.getAttribute('data-id');
     if (act === 'edit') return dlg(servers.find((x) => x.id === id));
+    if (act === 'tools') {
+      const st = status[id] || {};
+      const names = st.toolNames || [];
+      const aud = st.audience || [];
+      openDlg('MCP 工具 · ' + id,
+        (names.length
+          ? '<p class="hint" style="margin:0 0 10px">已挂载 ' + names.length + ' 个工具（名字带 <b class="mono">mcp_' + esc(id) + '_</b> 前缀）：</p>' +
+            '<div class="row">' + names.map((n) => '<span class="tag mono" style="margin-bottom:4px">' + esc(n) + '</span>').join('') + '</div>'
+          : '<div class="empty">没有已挂载的工具（连接失败或服务器没提供工具）</div>') +
+        (aud.length ? '<p class="hint" style="margin:12px 0 0">对哪边可见：' + esc(aud.map((x) => (x === 'reply' ? '回复模型' : '子 agent')).join('、')) + '</p>' : ''),
+        null, null);
+      return;
+    }
     if (act === 'del') {
       openDlg('删除 MCP 服务器',
         '<p style="font-size:13px;color:var(--ink2)">确定删除 <b class="mono">' + esc(id) + '</b>？它的全部工具会从注册表摘掉。</p>',

@@ -42,6 +42,8 @@ export interface Persistence {
   saveMemory(personId: string, item: MemoryItem): number;
   /** 记忆的嵌入向量算好后补写（换模型重算也走这里） */
   saveMemoryVec(id: number, vec: Float32Array, model: string): void;
+  /** 删一条记忆（面板可删错记的/过时的；personId 一起约束，防误删别人的） */
+  deleteMemory(personId: string, id: number): boolean;
 
   loadHistory(personId: string, limit?: number): ChatMessage[];
   saveHistory(personId: string, msg: ChatMessage): void;
@@ -148,6 +150,7 @@ export function createNullPersistence(): Persistence {
     loadMemories: () => [],
     saveMemory: () => 0,
     saveMemoryVec: () => {},
+    deleteMemory: () => false,
     loadHistory: () => [],
     saveHistory: () => {},
     lastHistoryAt: () => undefined,
@@ -209,6 +212,7 @@ export function createSqlitePersistence(file: string): Persistence {
       'insert into memories (person_id, text, tags, channel, at, hot) values (?, ?, ?, ?, ?, ?)',
     ),
     updMemoryVec: db.prepare('update memories set vec = ?, vec_model = ? where id = ?'),
+    delMemory: db.prepare('delete from memories where person_id = ? and id = ?'),
 
     hist: db.prepare(
       'select role, content, tool_calls, at from history where person_id = ? order by id desc limit ?',
@@ -339,6 +343,11 @@ export function createSqlitePersistence(file: string): Persistence {
       // Float32Array → Buffer（拷贝一份，别共享底层 buffer）
       const blob = Buffer.from(new Uint8Array(vec.buffer, vec.byteOffset, vec.byteLength));
       q.updMemoryVec.run(blob, model, id);
+    },
+
+    deleteMemory(personId: string, id: number): boolean {
+      const r = q.delMemory.run(personId, id);
+      return Number(r.changes) > 0;
     },
 
     loadHistory(personId: string, limit = 60): ChatMessage[] {

@@ -163,6 +163,17 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'GET' && p === '/favicon.ico') {
+      // 直接把 SVG 源按 image/svg+xml 回（panel.html 里也有 <link rel="icon"> 指向 /panel/favicon.svg）
+      try {
+        const buf = readFileSync(fileURLToPath(new URL('./public/favicon.svg', import.meta.url)));
+        res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'max-age=3600' });
+        return void res.end(buf);
+      } catch {
+        return json(res, 404, { error: 'not found' });
+      }
+    }
+
     if (p.startsWith('/api/') && !authorized(req, url)) {
       return json(res, 401, { error: 'unauthorized', needToken: true });
     }
@@ -174,9 +185,11 @@ const server = createServer(async (req, res) => {
         displayName: person.displayName,
         bindings: person.bindings,
         preferredChannel: person.preferredChannel,
+        personaId: (person as unknown as { personaId?: string }).personaId,
         memoryCount: app.memory.all(person.id).length,
         taskCount: app.orch.list(person.id).length,
       }));
+      const mcpStatus = app.mcp.status();
       return json(res, 200, {
         time: Date.now(),
         counts: {
@@ -191,6 +204,13 @@ const server = createServer(async (req, res) => {
         tools: app.tools.list().map((t) => ({ name: t.name, description: t.description, timeoutMs: t.timeoutMs })),
         log: app.log.slice(-200),
         tasks: app.orch.all(),
+        // 概览页的摘要 tiles（定时任务 / MCP），不用每个页面再单独拉
+        jobs: { total: app.sched.list().length, enabled: app.sched.list().filter((j) => j.enabled).length },
+        mcp: {
+          servers: mcpStatus.length,
+          connected: mcpStatus.filter((s) => s.connected).length,
+          tools: mcpStatus.reduce((n, s) => n + s.tools, 0),
+        },
       });
     }
 
@@ -223,6 +243,18 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && p === '/api/memory') {
       const personId = url.searchParams.get('personId') ?? '';
       return json(res, 200, { personId, items: app.memory.all(personId) });
+    }
+
+    /** 删除一条记忆（面板「删除」按钮）：personId + 库里自增 id 双重约束防误删 */
+    if (req.method === 'POST' && p === '/api/memory/delete') {
+      const b = await readBody(req);
+      const personId = String(b.personId ?? '');
+      const id = Number(b.id);
+      if (!personId || !Number.isInteger(id)) return json(res, 400, { error: '缺 personId / id' });
+      const ok = app.memory.forget(personId, id);
+      return json(res, 200, ok
+        ? { ok: true }
+        : { ok: false, error: '没找到这条记忆（可能已被删除）' });
     }
 
     /** 记忆语义召回自测：personId + query → 带分数/来源的召回结果（调试向量+重排链路用） */
@@ -275,12 +307,18 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && p === '/api/search') {
       const b = await readBody(req);
       if (!b.query) return json(res, 400, { error: '缺 query' });
-      const r = await createMetasoSearch(holder.current)({
-        query: String(b.query),
-        scope: b.scope,
-        size: b.size ? Number(b.size) : undefined,
-      });
-      return json(res, 200, r);
+      // 业务性失败（如未配秘塔 key）转 400 + JSON：异常直接冒泡会变 500，
+      // 浏览器控制台每搜一次就红一条，看起来像面板坏了。
+      try {
+        const r = await createMetasoSearch(holder.current)({
+          query: String(b.query),
+          scope: b.scope,
+          size: b.size ? Number(b.size) : undefined,
+        });
+        return json(res, 200, r);
+      } catch (err) {
+        return json(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
     }
 
     if (req.method === 'POST' && p === '/api/remember') {
@@ -777,6 +815,49 @@ const server = createServer(async (req, res) => {
       };
       holder.current = saveConfig({ compression: policy });
       return json(res, 200, { ok: true, compression: policy });
+    }
+
+    // ── 面板设置：访问令牌 / 秘塔 key（改完即时生效，不用重启）──
+    if (req.method === 'GET' && p === '/api/settings') {
+      const c = holder.current;
+      return json(res, 200, {
+        panelTokenSet: Boolean(c.panelToken),
+        panelTokenMasked: c.panelToken ? maskKey(c.panelToken) : '',
+        metasoSet: Boolean(c.metasoApiKey),
+        metasoMasked: c.metasoApiKey ? maskKey(c.metasoApiKey) : '',
+        metasoScope: c.metasoScope ?? 'webpage',
+        searchSize: c.searchSize ?? 5,
+        panelPort: c.panelPort,
+        // 环境变量优先级高于配置文件：文件里改了也会被 env 盖掉，要提前说明
+        panelTokenFromEnv: Boolean(process.env.PANEL_TOKEN),
+        metasoFromEnv: Boolean(process.env.METASO_API_KEY),
+      });
+    }
+    if (req.method === 'POST' && p === '/api/settings') {
+      const b = await readBody(req);
+      const patch: Record<string, unknown> = {};
+      // 令牌：传了非空串 = 换新；clearPanelToken = 清掉（清掉后只允许本机访问）
+      if (b.clearPanelToken === true) patch.panelToken = '';
+      else if (typeof b.panelToken === 'string' && b.panelToken.trim()) patch.panelToken = b.panelToken.trim();
+      // 秘塔 key：留空 = 不改；clearMetaso = 清除
+      if (b.clearMetaso === true) patch.metasoApiKey = '';
+      else if (typeof b.metasoApiKey === 'string' && b.metasoApiKey.trim()) patch.metasoApiKey = b.metasoApiKey.trim();
+      // 检索偏好
+      const scope = String(b.metasoScope ?? '').trim();
+      if (scope) patch.metasoScope = scope;
+      const size = Number(b.searchSize);
+      if (Number.isFinite(size) && size > 0) patch.searchSize = Math.min(20, Math.floor(size));
+      if (!Object.keys(patch).length) return json(res, 400, { error: '没有要改的内容' });
+      const tokenChanged = 'panelToken' in patch;
+      const next = saveConfig(patch as never);
+      holder.current = next;
+      return json(res, 200, {
+        ok: true,
+        // 令牌变更要提醒前端立刻换掉本地存储，否则下一个请求就会被自己锁在门外
+        tokenChanged,
+        panelTokenSet: Boolean(next.panelToken),
+        note: '已保存并即时生效',
+      });
     }
 
     // ── 官方 QQ 通道 ────────────────────────────────

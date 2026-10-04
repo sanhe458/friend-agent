@@ -3,7 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#211d1a">
 <title>friend-agent · 控制台</title>
+<link rel="icon" type="image/svg+xml" href="/panel/favicon.svg">
 <link rel="stylesheet" href="/panel/app.css">
 </head>
 <body>
@@ -12,8 +14,9 @@
   <div class="box">
     <h3 style="font-size:15px;margin-bottom:6px">friend-agent 控制台</h3>
     <p style="color:var(--ink3);font-size:12.5px;margin-bottom:14px">需要访问令牌（面板启动日志里可见）</p>
-    <input id="gate-input" type="password" placeholder="粘贴令牌" style="margin-bottom:12px">
+    <input id="gate-input" type="password" placeholder="粘贴令牌" style="margin-bottom:12px" autocomplete="current-password">
     <button class="btn pri" id="gate-btn" style="width:100%">进入</button>
+    <p id="gate-err" style="display:none;color:var(--bad);font-size:12.5px;margin:10px 0 0"></p>
   </div>
 </div>
 
@@ -28,6 +31,10 @@
       <div class="row"><span>进程</span><span class="mono" id="sf-pid">—</span></div>
       <div class="row"><span>运行</span><span class="mono num" id="sf-up">—</span></div>
       <div class="row"><span>状态</span><span id="sf-dot"><i class="dot"></i> —</span></div>
+      <div class="row" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--side-line)">
+        <a href="/chat" target="_blank" rel="noopener" style="color:var(--side-ink2);border:0">独立对话页 ↗</a>
+        <button id="sf-logout" style="background:none;border:0;color:var(--side-ink2);font:inherit;font-size:11.5px;cursor:pointer;padding:0" title="清除本机保存的令牌">退出登录</button>
+      </div>
     </div>
   </aside>
 
@@ -37,6 +44,9 @@
       <h1 id="ttl">概览</h1>
       <span class="sub" id="tsub"></span>
       <div class="right" id="tacts"></div>
+      <button class="btn sm" id="top-refresh" title="立即刷新数据（R）">
+        <span id="rf-ico">↻</span><span id="rf-ago"></span>
+      </button>
     </header>
     <div class="body" id="body"><div class="wrap" id="view"></div></div>
   </div>
@@ -50,6 +60,14 @@
 </div></div>
 <div class="toast" id="toast"></div>
 <div class="jserr" id="jserr"></div>
+
+<div class="palette-mask" id="palette">
+  <div class="palette">
+    <input id="palette-q" placeholder="跳到页面 / 人…（↑↓ 选择，Enter 跳转，Esc 关闭）" autocomplete="off">
+    <div class="palette-list" id="palette-list"></div>
+    <div class="palette-foot">Ctrl / Cmd + K 随时唤起</div>
+  </div>
+</div>
 
 <script src="/panel/shell.js"></script>
 <script src="/panel/pages/overview.js"></script>
@@ -67,6 +85,7 @@
 <script src="/panel/pages/scheduled.js"></script>
 <script src="/panel/pages/personas.js"></script>
 <script src="/panel/pages/mcp.js"></script>
+<script src="/panel/pages/settings.js"></script>
 <script src="/panel/boot.js"></script>
 </body>
 </html>
