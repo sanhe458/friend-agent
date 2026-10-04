@@ -55,6 +55,8 @@ export interface CommandDeps {
   status: () => Record<string, unknown>;
   tasks: (personId: string) => Array<{ id: string; kind: string; status: string; progress: number; prompt: string }>;
   jobs: (personId?: string) => Array<{ id: string; title: string; spec: string; enabled: boolean }>;
+  /** 手动翻篇（/new）：立刻归档当前对话并提炼进记忆；返回 undefined = 没有可归档的对话 */
+  newContext: (personId: string) => Promise<{ messages: number } | undefined>;
 }
 
 /** 内置命令；要加新命令就在这里 reg.register(...) */
@@ -74,6 +76,17 @@ export function defaultCommands(deps: CommandDeps): CommandRegistry {
     name: 'ping',
     desc: '看看我在不在',
     run: () => ({ reply: '在。', note: 'pong' }),
+  });
+
+  reg.register({
+    name: 'new',
+    desc: '提前翻篇：当前对话立刻归档并提炼进记忆，开始新的上下文',
+    run: async ({ person }) => {
+      const r = await deps.newContext(person.id);
+      return r
+        ? { reply: `已翻篇 ✅ ${r.messages} 条消息已归档并提炼进记忆，这里是新的开始。`, note: `new → 翻篇 ${r.messages} 条` }
+        : { reply: '当前没有可归档的对话，上下文本来就是干净的。', note: 'new → 无可归档' };
+    },
   });
 
   reg.register({

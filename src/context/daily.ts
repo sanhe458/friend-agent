@@ -96,6 +96,18 @@ export class DailyContextManager {
 
   /**
    * 跨天检查 + 翻篇。返回 undefined = 还是同一天 / 没有可归档的历史（什么都没发生）。
+   * 不等跨天、立刻翻篇走 rolloverNow（/new 命令用）。
+   */
+  async rolloverIfNeeded(personId: string, history: ChatMessage[], now = Date.now()): Promise<RolloverResult | undefined> {
+    const today = dayKey(now);
+    const day = this.#dayOf.get(personId);
+    if (!day || day === today) return undefined;
+    return this.rolloverNow(personId, history, now);
+  }
+
+  /**
+   * 手动翻篇（/new 命令）：**跳过跨天检查**，立刻归档 → 提炼进记忆 → 清空。
+   * 返回 undefined = 没有可归档的历史（此时只把日期标成今天）。
    *
    * 顺序刻意安排成「数据安全优先」：
    *   ① 原始上下文先落盘（这一步失败就整轮放弃，历史原样保留，下条消息再试）；
@@ -104,12 +116,13 @@ export class DailyContextManager {
    *   ④ 清空持久层历史（内存里的由引擎清）；
    *   ⑤ 顺手清一次过期归档（每天至多一次，代价≈0）。
    */
-  async rolloverIfNeeded(personId: string, history: ChatMessage[], now = Date.now()): Promise<RolloverResult | undefined> {
+  async rolloverNow(personId: string, history: ChatMessage[], now = Date.now()): Promise<RolloverResult | undefined> {
     const today = dayKey(now);
-    const day = this.#dayOf.get(personId);
-    if (!day || day === today) return undefined;
+    // 归档日 = 这份历史所属的那天：优先取标记值——当天第一条消息就是 /new 时，
+    // 历史其实还是昨天的，应归档到昨天（翻完再标成今天）
+    const day = this.#dayOf.get(personId) ?? today;
     if (!history.length) {
-      // 没有历史就没有「昨天」可言，直接标成今天
+      // 没有历史就没有可归档的东西，直接标成今天
       this.#dayOf.set(personId, today);
       return undefined;
     }

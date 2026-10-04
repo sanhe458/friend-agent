@@ -2,7 +2,7 @@ import { contextBudget, type CompressionPolicy } from '../config.ts';
 import type { Inbound, Outbound, Person } from '../core/types.ts';
 import type { Injection } from '../core/queue.ts';
 import { compressIfNeeded } from '../context/compress.ts';
-import { dayKey, type DailyContextManager } from '../context/daily.ts';
+import { dayKey, type DailyContextManager, type RolloverResult } from '../context/daily.ts';
 import type { MemoryStore } from '../memory/store.ts';
 import { chatCompletion, chatStream, type ChatMessage } from '../models/client.ts';
 import type { ModelRegistry } from '../models/registry.ts';
@@ -123,6 +123,22 @@ export class ReplyEngine {
   /** 外部（子 agent / 调度器）往这个人的时间线里插一条事件，让对话页也能看见 */
   note(personId: string, ev: TurnEvent): void {
     this.#eventsSet(personId, ev);
+  }
+
+  /**
+   * 手动翻篇（/new 命令）：不等跨天，立刻把当前对话归档 + 提炼进记忆，干净开局。
+   * 返回 undefined = 没有可归档的对话（或没接每日上下文）。
+   */
+  async newContext(personId: string): Promise<RolloverResult | undefined> {
+    if (!this.#daily) return undefined;
+    const rolled = await this.#daily.rolloverNow(personId, this.#historyOf(personId), Date.now());
+    if (!rolled) return undefined;
+    this.#history.set(personId, []); // 干净开局
+    this.#emit(personId, {
+      kind: 'notice', at: Date.now(),
+      text: `手动翻篇：${rolled.messages} 条消息已归档并提炼进记忆，这里是新的开始。\n【${rolled.day} 摘要】${rolled.summary.slice(0, 400)}`,
+    }, true);
+    return rolled;
   }
 
   #eventsSet(personId: string, ev: TurnEvent): void {

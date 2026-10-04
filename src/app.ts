@@ -27,7 +27,7 @@ import type { StreamHandle } from './adapters/adapter.ts';
 import { MockAdapter } from './adapters/mock.ts';
 import { QQAdapter } from './adapters/qq.ts';
 import { ReplyEngine } from './reply/engine.ts';
-import { DailyContextManager } from './context/daily.ts';
+import { DailyContextManager, type RolloverResult } from './context/daily.ts';
 import { createMetasoSearch, type SearchFn } from './tools/metaso.ts';
 import { transcribe, bytesFromDataUrl } from './models/asr.ts';
 import { ModelRegistry } from './models/registry.ts';
@@ -469,6 +469,13 @@ export function createApp(opts: {
     jobs: (pid) => sched.list()
       .filter((j) => !pid || j.personId === pid)
       .map((j) => ({ id: j.id, title: j.title, spec: j.spec, enabled: j.enabled })),
+    // /new：提前翻篇。串进 person 队列——撞上进行中的轮次就等它收尾再翻篇，
+    // 避免把「刚说完的这轮」留在旧上下文里归档不掉
+    newContext: async (pid) => {
+      let rolled: RolloverResult | undefined;
+      await queue.run(pid, async () => { rolled = await engine.newContext(pid); });
+      return rolled;
+    },
   });
 
   sched.start();

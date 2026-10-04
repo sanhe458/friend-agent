@@ -12,6 +12,7 @@ import type { Person } from '../src/core/types.ts';
 import { MemoryStore } from '../src/memory/store.ts';
 import { createNullPersistence, createSqlitePersistence } from '../src/store/persist.ts';
 import { ARCHIVE_RETENTION_DAYS, DailyContextManager, dayKey } from '../src/context/daily.ts';
+import { defaultCommands } from '../src/core/commands.ts';
 
 /**
  * 每日上下文翻篇 · 离线自测（不打任何 API）。
@@ -109,6 +110,45 @@ const hits = daily2.search(pid2, '橘子');
 check('search 命中关键词', hits.length === 2 && hits.every((h) => h.day === yesterday), `${hits.length} 条`);
 check('search 搜不到别人的档', daily2.search('p_other', '橘子').length === 0);
 check('search 无关词返回空', daily2.search(pid2, '不存在的词xyz').length === 0);
+
+// ── 3.5 手动翻篇（/new 的底层：rolloverNow 跳过跨天检查）─────────────────────────────
+console.log('\n▶ 手动翻篇 rolloverNow（/new 底层）');
+{
+  const db4 = createSqlitePersistence(join(ws, 'main4.db'));
+  const memory4 = new MemoryStore(db4);
+  const daily4 = new DailyContextManager({
+    memory: memory4, persist: db4, archiveDir: join(ws, 'archives'),
+    summarize: summarizeOk, log: (s) => console.log(`    [log] ${s}`),
+  });
+  daily4.markDay('p_test4', today); // 同一天！
+  check('对照：同一天 rolloverIfNeeded 不翻篇', (await daily4.rolloverIfNeeded('p_test4', HIST, now)) === undefined);
+  const r4 = await daily4.rolloverNow('p_test4', HIST, now);
+  check('同一天 rolloverNow 也能翻篇', !!r4 && r4.messages === 4 && r4.day === today);
+  check('归档落盘且摘要进记忆', !!r4 && existsSync(r4.file) && memory4.all('p_test4').some((m) => m.tags.includes('daily-summary') && m.tags.includes(today)));
+  check('历史已清空', db4.loadHistory('p_test4', 10).length === 0 && db4.lastHistoryAt('p_test4') === undefined);
+  check('空历史 → undefined', (await daily4.rolloverNow('p_test4b', [], now)) === undefined);
+  db4.close();
+}
+
+// ── 3.6 /new 命令（defaultCommands）─────────────────────────────
+console.log('\n▶ /new 命令');
+{
+  const cmdReg = defaultCommands({
+    personBindings: () => [], status: () => ({}), tasks: () => [], jobs: () => [],
+    newContext: async (pid) => (pid === 'p_cmd' ? { messages: 5 } : undefined),
+  });
+  const runCmd = async (name: string, personId: string) => await cmdReg.get(name)?.run({
+    person: { id: personId, displayName: '测试', bindings: [], createdAt: now },
+    msg: { channel: 'panel', chatType: 'private', externalId: 'e', at: now, text: '/' + name },
+    args: '',
+  });
+  const ok = await runCmd('new', 'p_cmd');
+  check('/new 有归档时回复确认', ok?.reply?.includes('已翻篇') === true && ok.reply.includes('5 条'), ok?.reply);
+  const empty = await runCmd('new', 'p_nobody');
+  check('/new 无可归档时回复提示', empty?.reply?.includes('没有可归档') === true);
+  const help = await runCmd('help', 'p_cmd');
+  check('/help 列出 /new', help?.reply?.includes('/new') === true);
+}
 
 // ── 4. 摘要失败兜底 ─────────────────────────────
 console.log('\n▶ 摘要生成失败兜底');
@@ -246,6 +286,21 @@ console.log('\n▶ 引擎级端到端（ReplyEngine + mock 模型）');
     { drain: () => [] },
   );
   check('同日第二轮不再翻篇', seen[0]?.length === 4 && !notices.slice(1).some((t) => t.includes('上下文翻篇')), `发给模型 ${seen[0]?.length} 条`);
+
+  // /new：不等跨天手动翻篇（此时历史 = 两轮对话共 4 条）
+  const rNew = await engine.newContext('p_e2e');
+  check('engine.newContext 手动翻篇', !!rNew && rNew.messages === 4 && rNew.day === today);
+  check('手动翻篇归档落盘（今天的目录）', dailyE.listDays('p_e2e').some((d) => d.day === today && d.count === 4));
+  check('手动翻篇记忆里有了今天的摘要', memoryE.all('p_e2e').filter((m) => m.tags.includes('daily-summary')).length === 2);
+  check('刚翻完再翻 → undefined（没有可归档）', (await engine.newContext('p_e2e')) === undefined);
+  seen.length = 0;
+  await engine.handle(
+    person,
+    { channel: 'panel', chatType: 'private', externalId: 'u1', text: '重新开始', at: now },
+    { drain: () => [] },
+  );
+  check('手动翻篇后上下文干净（2 条）', seen[0]?.length === 2, `发给模型 ${seen[0]?.length} 条`);
+
   mock.close();
   dbE2.close();
 }
