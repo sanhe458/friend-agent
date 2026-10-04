@@ -2,6 +2,7 @@ import { contextBudget, type CompressionPolicy } from '../config.ts';
 import type { Inbound, Outbound, Person } from '../core/types.ts';
 import type { Injection } from '../core/queue.ts';
 import { compressIfNeeded } from '../context/compress.ts';
+import { dayKey, type DailyContextManager } from '../context/daily.ts';
 import type { MemoryStore } from '../memory/store.ts';
 import { chatCompletion, chatStream, type ChatMessage } from '../models/client.ts';
 import type { ModelRegistry } from '../models/registry.ts';
@@ -38,6 +39,11 @@ export interface ReplyDeps {
   notice?: (text: string) => void;
   /** 接上就持久化历史与事件 */
   persist?: Persistence;
+  /**
+   * 每日上下文（三河 2026-10-04）：跨天翻篇——前一天上下文归档 + 提炼进记忆，
+   * 今天从干净上下文开始。不接 = 维持旧行为（历史一直滚，快满才压缩）。
+   */
+  daily?: DailyContextManager;
 }
 
 function safeJson(s: string): unknown {
@@ -66,6 +72,7 @@ export class ReplyEngine {
   #personaFor?: (person: Person) => PersonaPreset;
   #notice: (t: string) => void;
   #persist?: Persistence;
+  #daily?: DailyContextManager;
   #history = new Map<string, ChatMessage[]>();
   #events = new Map<string, TurnEvent[]>();
 
@@ -78,6 +85,7 @@ export class ReplyEngine {
     this.#personaFor = deps.personaFor;
     this.#notice = deps.notice ?? (() => {});
     this.#persist = deps.persist;
+    this.#daily = deps.daily;
   }
 
   /** 历史懒加载：内存没有就从库里拉 */
@@ -86,6 +94,11 @@ export class ReplyEngine {
     if (!h) {
       h = this.#persist?.enabled ? this.#persist.loadHistory(personId, HISTORY_LIMIT) : [];
       this.#history.set(personId, h);
+      // 恢复「当前上下文属于哪一天」：重启后靠库里最后一条消息的时间还原。
+      // ⚠️ 不还原的话，「跨天 + 中途重启」的组合会让昨天的上下文悄悄活到今天——
+      //    正是每日翻篇要消灭的那种污染。
+      const last = this.#persist?.enabled ? this.#persist.lastHistoryAt(personId) : undefined;
+      this.#daily?.markDay(personId, last != null ? dayKey(last) : dayKey(Date.now()));
     }
     return h;
   }
@@ -136,6 +149,24 @@ export class ReplyEngine {
     const text = (msg.text ?? '').trim();
 
     this.#emit(person.id, { kind: 'user', at: Date.now(), channel: msg.channel, text }, false);
+
+    // ── 每日翻篇（三河 2026-10-04）────────────────
+    // 跨天后的第一条消息：把前一天的上下文归档 + 提炼进记忆，然后从干净的历史开始。
+    // 这样上下文窗口里永远只有「今天」的对话——压缩只是同一天内的应急手段，
+    // 不再承担跨天记忆职责（那是记忆召回和归档查询的事），污染面小得多。
+    const today = dayKey(Date.now());
+    if (this.#daily) {
+      const rolled = await this.#daily.rolloverIfNeeded(person.id, this.#historyOf(person.id), Date.now());
+      if (rolled) {
+        this.#history.set(person.id, []); // 新的一天，干净开局
+        this.#emit(person.id, {
+          kind: 'notice', at: Date.now(),
+          text: `上下文翻篇（${rolled.day} → ${today}）：前一天 ${rolled.messages} 条消息已归档并提炼进记忆，今天从干净上下文开始。\n【${rolled.day} 摘要】${rolled.summary.slice(0, 400)}`,
+        }, true);
+      } else if (this.#daily.dayOf(person.id) !== today) {
+        this.#daily.markDay(person.id, today);
+      }
+    }
 
     // 自动召回：不靠模型主动调，每轮先注入 top-k（配了嵌入模型走语义召回，失败自动退关键词）
     const recalled = await this.#memory.recall(person.id, text, 4);
@@ -304,6 +335,9 @@ export class ReplyEngine {
       this.#persist?.saveHistory(person.id, asMsg);
     }
     if (hist.length > HISTORY_LIMIT) hist.splice(0, hist.length - HISTORY_LIMIT);
+
+    // 这一轮属于「今天」：跨天判定以每轮活跃日为准（下一条跨天消息会触发翻篇归档）
+    this.#daily?.markDay(person.id, today);
 
     if (injections.length) reply += `\n（另外记下你说的：${injections.join('、')}）`;
 

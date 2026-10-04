@@ -1,4 +1,5 @@
 import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import type { AppConfig } from './config.ts';
 import { loadConfig } from './config.ts';
 import type { Inbound, Outbound } from './core/types.ts';
@@ -26,9 +27,12 @@ import type { StreamHandle } from './adapters/adapter.ts';
 import { MockAdapter } from './adapters/mock.ts';
 import { QQAdapter } from './adapters/qq.ts';
 import { ReplyEngine } from './reply/engine.ts';
+import { DailyContextManager } from './context/daily.ts';
 import { createMetasoSearch, type SearchFn } from './tools/metaso.ts';
 import { transcribe, bytesFromDataUrl } from './models/asr.ts';
 import { ModelRegistry } from './models/registry.ts';
+import { chatCompletion } from './models/client.ts';
+import { registerArchiveTool } from './tools/archive.ts';
 import { createPiHarness, type PiProviderEntry } from './harness/pi.ts';
 import { createLocalHarness } from './harness/local.ts';
 import { createSqlitePersistence, type Persistence } from './store/persist.ts';
@@ -86,7 +90,8 @@ export function createApp(opts: {
   const getConfig = opts.getConfig ?? (() => loadConfig());
 
   // 落库：默认 SQLite，可通过 config.dbPath / 环境变量 FRIEND_DB 指定
-  const persist = createSqlitePersistence(getConfig().dbPath ?? DB_PATH);
+  const dbFile = getConfig().dbPath ?? DB_PATH;
+  const persist = createSqlitePersistence(dbFile);
 
   const identity = new IdentityService(persist);
   // ⚠️ models 必须先于 memory 声明：MemoryStore 构造时会做向量 backfill，
@@ -208,12 +213,36 @@ export function createApp(opts: {
       ?? BUILTIN_PERSONA;
   };
 
+  // ── 每日上下文（三河 2026-10-04）──────────────────────────
+  // 上下文按天翻篇：跨天时旧上下文归档（archives/<日期>/<person>.json，保留 60 天）、
+  // 提炼摘要进记忆、当天从干净上下文开始。AI 用 archive_query 工具回看历史。
+  const daily = new DailyContextManager({
+    memory,
+    persist,
+    archiveDir: join(dirname(dbFile), 'archives'),
+    summarize: async (text) => {
+      const hit = models.resolve('reply') ?? models.resolve('main');
+      if (!hit) throw new Error('没有配置可用的对话模型（reply / main）');
+      const r = await chatCompletion({
+        provider: hit.provider, model: hit.model.model, maxTokens: 500, temperature: 0.3,
+        messages: [
+          { role: 'system', content: '把这段对话压成一份简洁的「当日摘要」，保留：对方是谁、聊了什么、关键事实、约定、未完成的事。第三人称，不寒暄，500 字以内。' },
+          { role: 'user', content: text },
+        ],
+      });
+      return r.text;
+    },
+    log: (s) => push({ at: Date.now(), dir: 'sys', channel: '-', text: s }),
+  });
+  registerArchiveTool(tools, daily);
+
   const engine = new ReplyEngine({
     memory,
     tools,
     orch,
     models,
     persist,
+    daily,
     compression: () => getConfig().compression,
     personaFor,
     notice: (text) => push({ at: Date.now(), dir: 'sys', channel: '-', text }),

@@ -45,6 +45,10 @@ export interface Persistence {
 
   loadHistory(personId: string, limit?: number): ChatMessage[];
   saveHistory(personId: string, msg: ChatMessage): void;
+  /** 这个人历史里最后一条消息的时间（没有历史 = undefined）；每日翻篇用它恢复「当前属于哪天」 */
+  lastHistoryAt(personId: string): number | undefined;
+  /** 清空这个人的历史（每日翻篇：旧上下文归档后从活跃区清走，见 src/context/daily.ts） */
+  clearHistory(personId: string): void;
 
   loadEvents(personId: string, limit?: number): Array<Record<string, unknown>>;
   saveEvent(personId: string, ev: Record<string, unknown>): void;
@@ -146,6 +150,8 @@ export function createNullPersistence(): Persistence {
     saveMemoryVec: () => {},
     loadHistory: () => [],
     saveHistory: () => {},
+    lastHistoryAt: () => undefined,
+    clearHistory: () => {},
     loadEvents: () => [],
     saveEvent: () => {},
     loadTasks: () => [],
@@ -210,6 +216,8 @@ export function createSqlitePersistence(file: string): Persistence {
     insHist: db.prepare(
       'insert into history (person_id, role, content, tool_calls, at) values (?, ?, ?, ?, ?)',
     ),
+    lastHistAt: db.prepare('select at from history where person_id = ? order by id desc limit 1'),
+    clearHist: db.prepare('delete from history where person_id = ?'),
 
     evts: db.prepare('select at, kind, data from events where person_id = ? order by id desc limit ?'),
     insEvt: db.prepare('insert into events (person_id, at, kind, data) values (?, ?, ?, ?)',),
@@ -353,6 +361,15 @@ export function createSqlitePersistence(file: string): Persistence {
         sinceHistPrune = 0;
         try { q.pruneHist.run(personId, personId, KEEP_HISTORY); } catch { /* 修剪失败不影响写入 */ }
       }
+    },
+
+    lastHistoryAt(personId: string): number | undefined {
+      const r = q.lastHistAt.get(personId) as { at: number | bigint } | undefined;
+      return r ? Number(r.at) : undefined;
+    },
+
+    clearHistory(personId: string): void {
+      q.clearHist.run(personId);
     },
 
     loadEvents(personId: string, limit = 200): Array<Record<string, unknown>> {
