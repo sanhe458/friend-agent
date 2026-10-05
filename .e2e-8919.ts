@@ -3,9 +3,6 @@
  *
  * 运行：NODE_PATH=$(npm root -g) node --experimental-strip-types scripts/panel-e2e-test.ts
  * 前提：面板已在本机 8918 跑起来（FRIEND_DB 指向测试库），无 PANEL_TOKEN（仅本机放行）。
- *       且库里先有一个「显示名为 测试用户」的人（对话页下拉断言依赖这个名字）；
- *       副本运行要放在 scripts/ 下（用 import.meta.dirname 找 test-mcp-server.cjs）；
- *       想指向别的实例/端口：E2E_BASE=http://127.0.0.1:8919 node scripts/panel-e2e-test.ts
  *
  * 覆盖：
  *   - 0. 准备测试数据（幂等：清旧记忆 → 写入固定 3 条，保证过滤/删除断言有稳定基线）
@@ -24,7 +21,7 @@
 import { join } from 'node:path';
 import { chromium, type Page, type Browser } from 'playwright';
 
-const BASE = process.env.E2E_BASE ?? 'http://127.0.0.1:8918';
+const BASE = 'http://127.0.0.1:8919';
 const results: Array<{ name: string; ok: boolean; note?: string }> = [];
 const jsErrors: string[] = [];
 const httpErrs: string[] = [];
