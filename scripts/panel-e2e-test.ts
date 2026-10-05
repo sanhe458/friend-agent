@@ -18,6 +18,7 @@
  *   - 日志页：过滤 / 暂停；任务页 pills；概览人员卡跳转
  *   - 手机视口：抽屉开合、切页、真实命中测试
  */
+import { join } from 'node:path';
 import { chromium, type Page, type Browser } from 'playwright';
 
 const BASE = 'http://127.0.0.1:8918';
@@ -37,6 +38,18 @@ async function expect(name: string, cond: boolean | Promise<boolean>, note?: str
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** 点一个可能不可点/超时的元素：失败记一笔就继续，不中断后面的步骤。
+ *  （以前一次 click 超时会抛异常把整个测试带走，导致“没跑到”被误读成“全绿”） */
+async function clickOrFail(page: Page, selector: string, name: string, timeout = 5000): Promise<boolean> {
+  try {
+    await page.click(selector, { timeout });
+    return true;
+  } catch (err) {
+    report(name, false, (err as Error).message.split('\n')[0].slice(0, 120));
+    return false;
+  }
+}
 
 /** 轮询直到 cond 为真或超时（自动刷新/异步渲染有竞速窗口，单次断言会误报） */
 async function pollFor(fn: () => boolean | Promise<boolean>, ms = 2500, step = 150): Promise<boolean> {
@@ -297,17 +310,18 @@ async function main() {
   await expect('新增服务商成功', tProv.includes('已保存'), tProv);
   await sleep(900);
   await expect('服务商出现在列表', (await page.locator('#view').textContent())!.includes('e2e-prov'));
-  // 编辑
-  await page.click('[data-act="pv-edit"]');
+  // 编辑（⚠️ 必须带 data-id：列表里有多个服务商时，无 id 会点到第一个 → 误改别人的）
+  await page.click('[data-act="pv-edit"][data-id="e2e-prov"]');
   await page.fill('#p-name', 'E2E 服务商改');
   await dlgOk(page, '保存');
   await sleep(900);
   await expect('编辑服务商生效', (await page.locator('#view').textContent())!.includes('E2E 服务商改'));
-  // 删除
-  await page.click('[data-act="pv-del"]');
-  await dlgOk(page, '删除');
-  await sleep(900);
-  await expect('删除服务商生效', !(await page.locator('#view').textContent())!.includes('e2e-prov'));
+  // 删除（同样必须带 data-id；无 id 会点到第一个，可能撞上「有模型挂着」的守卫）
+  if (await clickOrFail(page, '[data-act="pv-del"][data-id="e2e-prov"]', '删除服务商按钮可点')) {
+    await dlgOk(page, '删除');
+    await sleep(900);
+    await expect('删除服务商生效', !(await page.locator('#view').textContent())!.includes('e2e-prov'));
+  }
 
   console.log('\n── 8. MCP（真实 stdio 服务器）──');
   await page.evaluate(`document.querySelector('[data-tab="mcp"]').click()`);
@@ -315,26 +329,30 @@ async function main() {
   await page.click('#mcp-add');
   await page.fill('#ms-id', 'e2e-mcp');
   await page.fill('#ms-cmd', 'node');
-  await page.fill('#ms-args', '/root/friend-agent/scripts/test-mcp-server.cjs');
+  // ⚠️ 用相对仓库的路径：写死绝对路径换台机器就 spawn 失败，后面步骤会被连带崩掉
+  await page.fill('#ms-args', join(import.meta.dirname, 'test-mcp-server.cjs'));
   await dlgOk(page, '保存');
   const tMcp = await waitToast(page, '已保存并同步连接');
   await expect('MCP 服务器已保存', tMcp.includes('已保存并同步连接'), tMcp);
   await sleep(2500); // 等子进程握手
   const mcpTxt = await page.locator('#view').textContent();
   await expect('MCP 显示已连', String(mcpTxt).includes('已连'), '');
-  const toolsBtn = page.locator('[data-act="tools"]');
+  const toolsBtn = page.locator('[data-act="tools"][data-id="e2e-mcp"]');
   if (await toolsBtn.count()) {
-    await toolsBtn.first().click();
-    const dlgTxt = await page.locator('#dlg-b').textContent();
-    await expect('工具列表弹窗有内容', String(dlgTxt).includes('mcp_e2e-mcp_') || String(dlgTxt).includes('已挂载'), String(dlgTxt).slice(0, 80));
-    await page.keyboard.press('Escape');
+    // 未连接时按钮是 disabled，直接 click 会超时抛异常 → 记一笔继续
+    if (await clickOrFail(page, '[data-act="tools"][data-id="e2e-mcp"]', 'MCP 工具按钮可点（未连接会 disabled）')) {
+      const dlgTxt = await page.locator('#dlg-b').textContent();
+      await expect('工具列表弹窗有内容', String(dlgTxt).includes('mcp_e2e-mcp_') || String(dlgTxt).includes('已挂载'), String(dlgTxt).slice(0, 80));
+      await page.keyboard.press('Escape');
+    }
   } else {
     report('工具列表弹窗有内容', false, '没有「工具」按钮（未连接？）');
   }
-  await page.click('[data-act="del"]');
-  await dlgOk(page, '删除');
-  await sleep(1200);
-  await expect('MCP 删除生效', !(await page.locator('#view').textContent())!.includes('e2e-mcp'));
+  if (await clickOrFail(page, '[data-act="del"][data-id="e2e-mcp"]', 'MCP 删除按钮可点')) {
+    await dlgOk(page, '删除');
+    await sleep(1200);
+    await expect('MCP 删除生效', !(await page.locator('#view').textContent())!.includes('e2e-mcp'));
+  }
 
   console.log('\n── 9. 设置页（写路径 + 令牌跟随）──');
   await page.evaluate(`document.querySelector('[data-tab="settings"]').click()`);
@@ -473,4 +491,13 @@ async function main() {
   process.exit(fails.length ? 1 : 0);
 }
 
-main().catch((err) => { console.error('测试脚本崩溃：', err); process.exit(2); });
+main().catch((err) => {
+  console.error('测试脚本崩溃：', err);
+  // 崩了也要把已跑出来的结果报出来，否则“没跑到”会被误读成“全绿”
+  const fails = results.filter((r) => !r.ok);
+  console.log('\n══════════ 汇总（崩溃中断）══════════');
+  console.log(`已跑 ${results.length} 项，通过 ${results.length - fails.length}，失败 ${fails.length}`);
+  for (const f of fails) console.log('  ✗ ' + f.name + (f.note ? ' — ' + f.note : ''));
+  console.log('⚠️ 崩溃中断，后续步骤未执行');
+  process.exit(2);
+});
