@@ -12,3 +12,7 @@ shots/
 
 # node
 node_modules/
+
+# 本地临时验证产物（自动推送用 git add -A，别把这些扫进库）
+.e2e*.ts
+.repro*.ts
