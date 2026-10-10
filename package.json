@@ -10,9 +10,12 @@
   "scripts": {
     "demo": "node src/index.ts",
     "cli": "node src/index.ts --cli",
-    "panel": "node src/panel/server.ts"
+    "panel": "node src/panel/server.ts",
+    "zen-gate": "node scripts/zen-gate.ts",
+    "zen-gate-test": "node scripts/zen-gate-test.ts"
   },
   "devDependencies": {
-    "@types/node": "^22.20.5"
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3"
   }
 }

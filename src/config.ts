@@ -47,8 +47,10 @@ export interface ModelMeta {
  * - vision    图像理解（预留）
  * - embedding 向量：记忆语义召回用
  * - rerank    重排序：记忆召回的精排段用
+ * - jev       Jev 型 System One 判定模型（OpenCode Zen）：只答 choice/score/noul
+ *             结构化判定，不做内容生成；走 Zen 网关的 /v1/systemone 专线
  */
-export type ModelKind = 'chat' | 'asr' | 'tts' | 'vision' | 'embedding' | 'rerank';
+export type ModelKind = 'chat' | 'asr' | 'tts' | 'vision' | 'embedding' | 'rerank' | 'jev';
 
 export interface ModelDef {
   /** 唯一键，角色引用的是它 */
@@ -104,6 +106,11 @@ export interface Roles {
   embedding?: string;
   /** 记忆召回的精排模型（kind='rerank'）。可选：只有配了 embedding 才有用武之地 */
   rerank?: string;
+  /**
+   * Jev 型 System One 判定模型（kind='jev'，OpenCode Zen）。可选。
+   * 判定模型不做内容生成，走 Zen 网关 /v1/systemone 专线；与对话角色严格分开。
+   */
+  jev?: string;
 }
 
 /** 官方 QQ 机器人通道配置 */

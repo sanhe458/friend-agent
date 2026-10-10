@@ -28,6 +28,7 @@ node src/index.ts --cli    # 起本地 CLI 通道，手动聊天
 | `adapters/` | QQ（WebSocket 网关 + 心跳 ACK 监控 + 45s 就绪超时 + 流式私聊）、Telegram（长轮询 + 429 重试）、CLI/Mock |
 | `store/persist.ts` | SQLite：persons/bindings/memories/history/events/tasks/jobs，**自动修剪** + 绑定先删后插（合并重启不回滚） |
 | `panel/` | Web 控制台（8918）：概览/对话/任务/定时/身份/记忆/通道/模型/**MCP**/角色/人格/日志/搜索/运行时/**设置** |
+| `zen/` | **OpenCode Zen 计划代理网关**（详见 [src/zen/README.md](./src/zen/README.md)）：免费车道 → OpenAI 兼容 `/v1` 接口；会话铸造、指纹门（tools 四元组）、三种线协议、DSML 清洗、429 自动 failover + 限流冷却；**兼容 Jev 型 System One 判定模型**（新模型类型 `kind: "jev"`，`/v1/systemone` 判定专线 + chat 误用双重拦截） |
 | 运维 | systemd 自启动（崩溃自愈实测）+ GitHub 自动推送（path 单元监听） |
 
 ## 已验证的关键行为

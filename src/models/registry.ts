@@ -58,6 +58,18 @@ export class ModelRegistry {
     return this.#functional('rerank');
   }
 
+  /**
+   * 拿一个 Jev 型判定模型（kind='jev'，OpenCode Zen System One）。
+   * 判定模型不做内容生成：配了 Zen 网关后走 /v1/systemone 专线，给意图/情绪判定用。
+   */
+  jev(): { model: ModelDef; provider: Provider } | undefined {
+    const byRole = this.roles().jev ? this.model(this.roles().jev as string) : undefined;
+    const m = byRole && byRole.kind === 'jev' ? byRole : this.byKind('jev')[0];
+    if (!m) return undefined;
+    const p = this.provider(m.providerId);
+    return p ? { model: m, provider: p } : undefined;
+  }
+
   /** 角色 → 具体提供商 + 模型 */
   resolve(role: RoleName): { model: ModelDef; provider: Provider } | undefined {
     const id = this.roles()[role];
