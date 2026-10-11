@@ -1,6 +1,9 @@
 import type { Persistence } from '../store/persist.ts';
 import type { Task, TaskEvent, TaskRunner } from './types.ts';
 
+/** 异常消息：非 Error 抛出（字符串/对象）也别顶着 "undefined" 调试 */
+const errText = (e: unknown): string => (e as Error)?.message ?? String(e);
+
 /**
  * 调度：模型分配是策略层（不是 LLM）。
  *
@@ -105,7 +108,7 @@ export class Orchestrator {
       }
       const fail = (err: unknown) => {
         task.status = 'failed';
-        task.result = `执行器抛错：${(err as Error).message}`;
+        task.result = `执行器抛错：${errText(err)}`;
         this.#persist?.saveTask(task);
         this.#emit({ taskId: id, kind: 'done', text: task.result });
       };

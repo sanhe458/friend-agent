@@ -1,6 +1,7 @@
 import { createPrivateKey, createPublicKey, sign as edSign, verify as edVerify } from 'node:crypto';
 import type { Capabilities, Inbound, MediaRef, Outbound } from '../core/types.ts';
 import type { Adapter, StreamHandle } from './adapter.ts';
+import { safeEmit } from './adapter.ts';
 
 const TOKEN_URL = 'https://bots.qq.com/app/getAppAccessToken';
 const API_BASE = 'https://api.sgroup.qq.com';
@@ -95,7 +96,11 @@ export class QQAdapter implements Adapter {
   #lastSeq: number | null = null;
   #heartbeat: NodeJS.Timeout | null = null;
   #emit: ((m: Inbound) => void) | null = null;
-  #stopped = false;
+  /**
+   * 入站投递：统一走 safeEmit —— `#emit` 是上层(await deliver 会 rethrow)的 async 函数，
+   * 直接 `#emit?.(m)` 丢掉 Promise 就是给 unhandled rejection 留门。
+   */
+  #fire(m: Inbound): void { safeEmit(this.#emit, m, this.#log); }  #stopped = false;
   #connecting = false;
   /**
    * 连接代次。stop() 后旧循环可能还活在 await 里（TCP 关闭/等待定时器都要时间），
@@ -300,8 +305,12 @@ export class QQAdapter implements Adapter {
         this.#status.dispatchCount += 1;
         this.#status.lastEvent = t;
 
-        // 先记一笔：让我们能看见 QQ 到底推了什么，而不是静默丢掉
-        this.#log(`[qq] ← ${t}${typeof pkt.s === 'number' ? ' s=' + pkt.s : ''} ${JSON.stringify(pkt.d ?? {}).slice(0, 110)}`);
+        // 先记一笔：让我们能看见 QQ 到底推了什么，而不是静默丢掉。
+        // ⚠️ 以前每个 DISPATCH 都 JSON.stringify + 写日志 + 推 SSE —— 频道成员变动
+        //    这类高频事件会把热路径拖垮（面板/控制台一起刷）。现在只有关键事件才记。
+        if (t === 'READY' || t === 'RESUMED' || t === 'RECONNECT' || /MESSAGE|INTERACTION/.test(t)) {
+          this.#log(`[qq] ← ${t}${typeof pkt.s === 'number' ? ' s=' + pkt.s : ''} ${JSON.stringify(pkt.d ?? {}).slice(0, 110)}`);
+        }
 
         if (t === 'READY') {
           this.#sessionId = pkt.d?.session_id;
@@ -320,7 +329,7 @@ export class QQAdapter implements Adapter {
           return;
         }
         const inbound = await this.toInbound({ t, d: pkt.d, id: pkt.id });
-        if (inbound) this.#emit?.(inbound);
+        if (inbound) this.#fire(inbound);
         return;
       }
       default:
@@ -344,6 +353,9 @@ export class QQAdapter implements Adapter {
       this.#missedAcks += 1;
       this.#heartbeatNow();
     }, intervalMs);
+    // ⚠️ 不 unref 的话这个 interval 会一直吊着事件循环：stop() 之后进程也退不出去
+    //    （systemd 只能超时 SIGKILL）。
+    this.#heartbeat.unref();
     this.#heartbeatNow();
   }
 
@@ -548,7 +560,14 @@ export class QQAdapter implements Adapter {
       end: async (final: string) => {
         closed = true;
         const text = final.slice(0, 1800);
-        // 收尾帧失败也不能把回复卡住：失败时返回 false，交给调用方一次性发送
+        // ⚠️ 以前这里有两个 bug：
+        //   ① DONE 帧不走 chain —— 某个 GENERATING 帧可能还在 429 退避重试里，
+        //      于是两条帧用同一个 index、还可能乱序到达，QQ 那侧直接错乱；
+        //   ② 返回值是 `framesOk > 0`（历史上任意一帧成功就算成功）——
+        //      于是「DONE 失败了但之前有帧成功过」时返回 true，
+        //      调用方就**不再补发**，用户永远停在一个"生成中"的残帧上。
+        // 现在：先等前序帧落地（index 也才准确），再发 DONE，只以 DONE 的结果为准。
+        try { await chain; } catch { /* 前序帧失败已各自记账 */ }
         try {
           await this.#post(this.#path(out.to, true), {
             input_mode: 'replace', input_state: INPUT_STATE.DONE, content_type: 'markdown',
@@ -556,10 +575,11 @@ export class QQAdapter implements Adapter {
             ...(streamMsgId ? { stream_msg_id: streamMsgId } : {}),
           });
           framesOk += 1;
+          return true;
         } catch (err) {
-          this.#log(`[qq] 流式收尾失败：${(err as Error).message.slice(0, 120)}`);
+          this.#log(`[qq] 流式收尾失败，改用一次性发送：${(err as Error).message.slice(0, 120)}`);
+          return false;
         }
-        return framesOk > 0;
       },
       abort: async () => { closed = true; },
     };

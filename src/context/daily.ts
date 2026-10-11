@@ -21,6 +21,9 @@ import { messageText } from './tokens.ts';
  * 归档按 person 物理分片（与记忆隔离同一条约束）：每个人只能查到自己的那份。
  */
 
+/** 异常消息：非 Error 抛出（字符串/对象）也别顶着 "undefined" 调试 */
+const errText = (e: unknown): string => (e as Error)?.message ?? String(e);
+
 /** 归档保留天数 */
 export const ARCHIVE_RETENTION_DAYS = 60;
 
@@ -86,6 +89,11 @@ export class DailyContextManager {
     return this.#dayOf.get(personId);
   }
 
+  /** person 没了 → 丢掉日期标记（归档文件本身保留，按 retention 自然过期） */
+  forget(personId: string): void {
+    this.#dayOf.delete(personId);
+  }
+
   markDay(personId: string, day: string): void {
     this.#dayOf.set(personId, day);
   }
@@ -131,12 +139,25 @@ export class DailyContextManager {
     const file = this.#fileFor(day, personId);
 
     // ① 原始上下文落盘（先于摘要：摘要要花 token，落盘失败不该反复烧钱重试）
+    // ⚠️ 同一天第二次翻篇（`/new` 用完又 `/new`、或跨天判定晚了一会儿）时，
+    //    day 是同一个 → 直接 writeFileSync 会**把当天早先那份归档覆盖掉**，
+    //    而「一天一个文件」正是 listDays/readDay/search 的全部查找依据 ——
+    //    早上的对话就这么从磁盘和检索里一起消失。现在：已存在就合并追加（按内容去重）。
+    let raw: DailyArchive;
+    const prev = this.#read(file);
+    if (prev && Array.isArray(prev.messages)) {
+      const seen = new Set(prev.messages.map((m) => `${m.role}\u0000${m.content ?? ''}`));
+      const merged = prev.messages.concat(msgs.filter((m) => !seen.has(`${m.role}\u0000${m.content ?? ''}`)));
+      raw = { ...prev, messages: merged };
+      this.#deps.log?.(`[日结] ${day} 已有归档，合并追加 ${prev.messages.length} → ${merged.length} 条`);
+    } else {
+      raw = { personId, day, archivedAt: now, messages: msgs };
+    }
     try {
       mkdirSync(join(this.#deps.archiveDir, day), { recursive: true });
-      const raw: DailyArchive = { personId, day, archivedAt: now, messages: msgs };
       writeFileSync(file, JSON.stringify(raw, null, 2));
     } catch (err) {
-      this.#deps.log?.(`[日结] ⚠️ 归档写盘失败，保留上下文下条消息再试：${(err as Error).message}`);
+      this.#deps.log?.(`[日结] ⚠️ 归档写盘失败，保留上下文下条消息再试：${errText(err)}`);
       return undefined;
     }
 
@@ -146,7 +167,7 @@ export class DailyContextManager {
       const text = history.map(messageText).join('\n').slice(0, 8000);
       summary = (await this.#deps.summarize(text)).trim() || '（空）';
     } catch (err) {
-      summary = `（摘要生成失败：${(err as Error).message}；原始对话已归档，可查 ${day} 的记录）`;
+      summary = `（摘要生成失败：${errText(err)}；原始对话已归档，可查 ${day} 的记录）`;
     }
     try {
       this.#deps.memory.write(personId, {
@@ -157,21 +178,21 @@ export class DailyContextManager {
         hot: false, // 长期记忆：这是翻篇时后台提炼的产物，不是前台随手记的短期条目
       });
     } catch (err) {
-      this.#deps.log?.(`[日结] ⚠️ 摘要写入记忆失败（归档不受影响）：${(err as Error).message}`);
+      this.#deps.log?.(`[日结] ⚠️ 摘要写入记忆失败（归档不受影响）：${errText(err)}`);
     }
 
     // ③ 摘要回填进归档（失败不影响：原始文件已在 ① 落盘）
+    //    ⚠️ 以前这里把刚写出去的文件又读回来再写一遍（raw 被关在 ① 的 try 里），
+    //      白白多一次读盘 + 解析 + 序列化。现在直接用内存里那份。
     try {
-      const doc = JSON.parse(readFileSync(file, 'utf8')) as DailyArchive;
-      doc.summary = summary;
-      writeFileSync(file, JSON.stringify(doc, null, 2));
+      writeFileSync(file, JSON.stringify({ ...raw, summary }, null, 2));
     } catch { /* 原始档还在 */ }
 
     // ④ 新的一天干净的上下文：持久层历史清空（内存那份由引擎自己清）
     try {
       if (this.#deps.persist?.enabled) this.#deps.persist.clearHistory(personId);
     } catch (err) {
-      this.#deps.log?.(`[日结] ⚠️ 清空历史失败：${(err as Error).message}`);
+      this.#deps.log?.(`[日结] ⚠️ 清空历史失败：${errText(err)}`);
     }
 
     // ⑤ 清理过期归档（保留 N 天，N 默认 60）
@@ -185,22 +206,34 @@ export class DailyContextManager {
     return { day, messages: msgs.length, summary, file };
   }
 
-  /** 这个人有哪些天的归档（按日期升序；count=-1 表示文件损坏读不出来） */
-  listDays(personId: string): Array<{ day: string; count: number }> {
-    const out: Array<{ day: string; count: number }> = [];
+  /** 这个人的归档文件清单（只列文件名，不解析内容） */
+  #dayFiles(personId: string): Array<{ day: string; file: string }> {
+    const out: Array<{ day: string; file: string }> = [];
     if (!existsSync(this.#deps.archiveDir)) return out;
     for (const name of readdirSync(this.#deps.archiveDir)) {
       if (!isDay(name)) continue;
       const f = this.#fileFor(name, personId);
       if (!existsSync(f)) continue;
-      try {
-        const doc = JSON.parse(readFileSync(f, 'utf8')) as DailyArchive;
-        out.push({ day: name, count: Array.isArray(doc.messages) ? doc.messages.length : -1 });
-      } catch {
-        out.push({ day: name, count: -1 });
-      }
+      out.push({ day: name, file: f });
     }
     return out.sort((a, b) => (a.day < b.day ? -1 : 1));
+  }
+
+  /** 读一个归档文件；坏了返回 undefined */
+  #read(file: string): DailyArchive | undefined {
+    try {
+      return JSON.parse(readFileSync(file, 'utf8')) as DailyArchive;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** 这个人有哪些天的归档（按日期升序；count=-1 表示文件损坏读不出来） */
+  listDays(personId: string): Array<{ day: string; count: number }> {
+    return this.#dayFiles(personId).map(({ day, file }) => {
+      const doc = this.#read(file);
+      return { day, count: doc && Array.isArray(doc.messages) ? doc.messages.length : -1 };
+    });
   }
 
   /** 读某一天的归档；没有/越界返回 undefined */
@@ -218,13 +251,18 @@ export class DailyContextManager {
   /**
    * 关键词搜索这个人自己的全部归档（多词 = 任一命中即计 1 分，命中越多越靠前）。
    * 只搜本人分片——归档与记忆一样按 person 物理隔离。
+   *
+   * ⚠️ 以前是 `listDays()` + `readDay()` 组合：listDays 已经把每个文件读+解析一遍
+   *    （只为了拿条数），readDay 又读一遍 —— 60 个归档 = 120 次读盘 + JSON.parse，
+   *    而且全在同步块里（工具的 5s 超时对同步代码毫无作用，整个进程都卡住）。
+   *    现在一遍搞定。
    */
   search(personId: string, query: string, limit = 20): Array<{ day: string; role: string; text: string; score: number }> {
     const terms = String(query || '').toLowerCase().split(/[\s,，。.!！?？、]+/).filter(Boolean);
     if (!terms.length) return [];
     const hits: Array<{ day: string; role: string; text: string; score: number }> = [];
-    for (const { day } of this.listDays(personId)) {
-      const doc = this.readDay(personId, day);
+    for (const { day, file } of this.#dayFiles(personId)) {
+      const doc = this.#read(file);
       if (!doc) continue;
       for (const m of doc.messages ?? []) {
         const hay = String(m.content ?? '').toLowerCase();
@@ -240,7 +278,12 @@ export class DailyContextManager {
 
   /** 删除超过保留期的归档目录；返回删了几个「天」 */
   purgeExpired(now = Date.now()): number {
-    const cutoff = dayKey(now - this.#retention * 86_400_000);
+    // ⚠️ 以前是 `dayKey(now - retention * 86400000)`：拿固定 24 小时去推日历日，
+    //    遇到夏令时切换的那一天会整体偏一天（该留的被删 / 该删的留着）。
+    //    改成按本地日历做日期减法，跟 dayKey 的语义对齐。
+    const d = new Date(now);
+    d.setDate(d.getDate() - this.#retention);
+    const cutoff = dayKey(d.getTime());
     if (!existsSync(this.#deps.archiveDir)) return 0;
     let n = 0;
     for (const name of readdirSync(this.#deps.archiveDir)) {

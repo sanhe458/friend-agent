@@ -40,11 +40,21 @@ export function rerankEndpoint(baseUrl: string): string {
 export async function rerank(opts: RerankOptions): Promise<RerankHit[]> {
   if (!opts.model) throw new Error('没有配置重排序模型');
   if (!opts.apiKey) throw new Error('重排序提供商没有配置 API key');
-  const documents = (opts.documents ?? []).filter((s) => typeof s === 'string' && s.length > 0);
+  const documents = opts.documents ?? [];
   if (!documents.length || !opts.query) return [];
 
-  const body: Record<string, unknown> = { model: opts.model, query: opts.query, documents };
-  if (opts.topN && opts.topN > 0) body.top_n = Math.min(opts.topN, documents.length);
+  // ⚠️ 以前是「过滤掉空串后直接发」，返回的 index 是**过滤后**数组的下标，
+  //    而调用方（memory/store.ts）拿它去索引**未过滤**的候选数组 ——
+  //    中间只要有一条空文本，后面每一条的 index 都错位，召回返回错误的记忆。
+  //    现在：发送时照样跳过空串，但 index 始终映射回原始下标。
+  const sendable: Array<{ index: number; text: string }> = [];
+  documents.forEach((text, index) => {
+    if (typeof text === 'string' && text.length > 0) sendable.push({ index, text });
+  });
+  if (!sendable.length) return [];
+
+  const body: Record<string, unknown> = { model: opts.model, query: opts.query, documents: sendable.map((d) => d.text) };
+  if (opts.topN && opts.topN > 0) body.top_n = Math.min(opts.topN, sendable.length);
 
   const res = await fetch(rerankEndpoint(opts.baseUrl), {
     method: 'POST',
@@ -61,11 +71,11 @@ export async function rerank(opts: RerankOptions): Promise<RerankHit[]> {
 
   const hits: RerankHit[] = [];
   for (const r of results) {
-    const index = Number(r.index);
+    const index = Number(r.index);          // 指向 sendable 的下标
     const score = Number(r.relevance_score ?? r.score);
-    if (!Number.isInteger(index) || index < 0 || index >= documents.length) continue;
+    if (!Number.isInteger(index) || index < 0 || index >= sendable.length) continue;
     if (!Number.isFinite(score)) continue;
-    hits.push({ index, score });
+    hits.push({ index: sendable[index].index, score }); // → 映射回原始下标
   }
   // 按分数降序（有的服务不给排序）
   return hits.sort((a, b) => b.score - a.score);

@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdirSync, writeFileSync, globSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ToolRegistry } from './registry.ts';
 
@@ -59,11 +60,27 @@ function makeCdp(ws: WebSocket) {
     try { m = JSON.parse(String((ev as MessageEvent).data)); } catch { return; }
     if (m?.id && waits.has(m.id)) { waits.get(m.id)!(m); waits.delete(m.id); }
   });
+  // ⚠️ 连接断了/页面崩了要在**这里**就 reject 掉所有等待者。以前只依赖
+  //    「响应到达时删除 waiter」，于是一次丢失的命令就有一个 Promise 永远挂着，
+  //    waits 只增不减（工具级 30s 超时只是把调用方挡住，waiter 还留在 map 里）。
+  ws.addEventListener('close', () => {
+    // 关闭时把所有在等的命令判失败（resolve 成 error 形状，调用方按 errorText 处理）
+    for (const [, res] of waits) {
+      try { res({ error: { message: 'CDP 连接已关闭' } }); } catch { /* ignore */ }
+    }
+    waits.clear();
+  });
   const send = (method: string, params: Record<string, unknown> = {}) =>
     new Promise<any>((res, rej) => {
       const i = ++msgId;
       waits.set(i, res);
-      try { ws.send(JSON.stringify({ id: i, method, params })); } catch (e) { waits.delete(i); rej(e); }
+      try { ws.send(JSON.stringify({ id: i, method, params })); }
+      catch (e) { waits.delete(i); rej(e); return; }
+      // 单条命令的超时兜底：页面卡死时不能把调用方挂到天荒地老
+      const timer = setTimeout(() => {
+        if (waits.delete(i)) rej(new Error(`CDP 命令超时：${method}`));
+      }, 30_000);
+      timer.unref?.();
     });
   return { send, pending: waits };
 }
@@ -100,24 +117,40 @@ function getSession(key: string): Promise<Session> {
 
   const p = (async (): Promise<Session> => {
     const chrome = findChrome();
+    // ⚠️ 两个坑，都真实发生过：
+    //   ① 端口是 `BASE_PORT + (portSeq++ % PORT_SPAN)`：跑满 40 次后会复用。
+    //      若那个端口上还挂着一个没退干净的旧 Chromium，`fetch(/json/version)`
+    //      拿到的是**旧浏览器**的 wsUrl —— 新起的进程随即因「profile in use」退出，
+    //      于是 sess.proc 指向一个死进程，而 ws 连的是别人的标签页；
+    //      closeSession 杀错 pid，旧 Chromium 变孤儿，之后每次还复用这条坏会话。
+    //   ② 整个 Chromium 没指定 --user-data-dir：多个会话共用默认 profile，
+    //      第二个实例直接起不来。
+    // 现在：每个会话自带独立 profile 目录 + 独立端口（不复用），
+    //      拿到 wsUrl 后再确认进程还活着，否则放弃重来。
     const port = BASE_PORT + (portSeq++ % PORT_SPAN);
+    const profile = join(tmpdir(), `fa-chrome-${portSeq}-${Date.now().toString(36)}`);
     const proc = spawn(chrome, [
       '--headless=new', `--remote-debugging-port=${port}`, '--no-sandbox',
-      '--disable-gpu', '--disable-dev-shm-usage', '--window-size=1440,980', 'about:blank',
+      '--disable-gpu', '--disable-dev-shm-usage', '--window-size=1440,980',
+      `--user-data-dir=${profile}`, 'about:blank',
     ], { stdio: 'ignore', detached: true });
 
     let wsUrl = '';
     for (let i = 0; i < 40; i++) {
       if (proc.exitCode !== null) break;
       try {
-        const j = (await fetch(`http://127.0.0.1:${port}/json/version`).then((r) => r.json())) as { webSocketDebuggerUrl?: string };
-        if (j?.webSocketDebuggerUrl) { wsUrl = j.webSocketDebuggerUrl; break; }
+        const j = (await fetch(`http://127.0.0.1:${port}/json/version`).then((r) => r.json())) as { webSocketDebuggerUrl?: string; Browser?: string };
+        // /json/version 里带 Browser 字段，且端口是本进程刚拉的 —— 只能确认「有东西在听」。
+        // 真正的判据是进程仍活着（下面那行）。
+        if (j?.webSocketDebuggerUrl && j.Browser) { wsUrl = j.webSocketDebuggerUrl; break; }
       } catch { /* 还没起来 */ }
       await sleep(300);
     }
-    if (!wsUrl) {
+    // 端口被别的实例占着时，新进程会自己退出 —— 这时拿到的 wsUrl 是别人的
+    if (!wsUrl || proc.exitCode !== null) {
       try { if (proc.pid) process.kill(-proc.pid, 'SIGKILL'); } catch { /* ignore */ }
-      throw new Error('chromium 启动失败（端口 ' + port + '）');
+      proc.kill('SIGKILL');
+      throw new Error(`chromium 启动失败（端口 ${port}${proc.exitCode !== null ? '，端口可能被占用' : ''}）`);
     }
 
     const tab = (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' }).then((r) => r.json())) as { webSocketDebuggerUrl: string };
@@ -185,7 +218,22 @@ export function registerBrowserTool(reg: ToolRegistry): void {
       try {
         if (a === 'open') {
           if (!args.url) return '✗ open 需要 url';
-          const u = /^(https?|data|file|about):/i.test(args.url) ? args.url : 'https://' + args.url;
+          // 🛡 协议白名单：http / https 正常开；
+          //    data:text/html 留着（自包含的测试页，源是 opaque，够不到本地文件）。
+          //    **file: 必须挡掉** —— `file:///etc/passwd` + action=text 就能把本机文件
+          //    读进模型上下文，而网页内容是可被 prompt injection 的，
+          //    等于给任意页面开了一条读本地文件的路。javascript:/about:/chrome: 同理不该进。
+          const raw = String(args.url).trim();
+          if (/^file:/i.test(raw)) {
+            return `✗ 不允许打开本地文件（file:）：${raw.slice(0, 80)}`;
+          }
+          if (/^(javascript|about|chrome|ftp|blob):/i.test(raw)) {
+            return `✗ 不支持的协议：${raw.slice(0, 80)}`;
+          }
+          if (/^data:/i.test(raw) && !/^data:text\/html/i.test(raw)) {
+            return `✗ 只支持 data:text/html：${raw.slice(0, 80)}`;
+          }
+          const u = /^(https?|data):/i.test(raw) ? raw : 'https://' + raw;
           const nav = await s.send('Page.navigate', { url: u });
           // ⚠️ 导航失败（DNS 挂了 / 域名打不开）会放在 errorText 里，不能当成功
           const navErr = nav?.result?.errorText;

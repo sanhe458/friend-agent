@@ -65,9 +65,11 @@ export function registerScheduleTools(reg: ToolRegistry, sched: Scheduler, ident
     description: '列出当前所有定时任务（编号、规则、下次时间、类型）',
     schema: { type: 'object', properties: {} },
     timeoutMs: 800,
-    run: async () => {
-      const jobs = sched.list();
-      if (!jobs.length) return '现在没有任何定时任务。';
+    run: async (_args: unknown, ctx) => {
+      // ⚠️ 以前不过滤 personId：任何人问一句都能看到**所有人**的定时任务
+      //    （标题和规则是自由文本，可能带隐私）。现在只列本人的。
+      const jobs = sched.list().filter((j) => j.personId === ctx.personId);
+      if (!jobs.length) return '你现在没有任何定时任务。';
       return jobs.map((j) =>
         `${j.id}｜${j.title}｜${j.spec}｜${new Date(j.nextAt).toLocaleString('zh-CN', { hour12: false })}｜${j.kind === 'ask' ? '触发思考' : '直接发话'}｜${j.enabled ? '启用' : '已停'}`,
       ).join('\n');
@@ -79,6 +81,12 @@ export function registerScheduleTools(reg: ToolRegistry, sched: Scheduler, ident
     description: '按编号取消一个定时任务',
     schema: { type: 'object', properties: { id: { type: 'string', description: '任务编号，如 j_ab12cd' } }, required: ['id'] },
     timeoutMs: 800,
-    run: async (args: any) => (sched.remove(String(args.id)) ? `已取消 ${args.id}` : `没找到编号 ${args.id}`),
+    run: async (args: any, ctx) => {
+      // 同上：只能取消自己的（带上 personId 比对，防止猜编号取消别人的任务）
+      const id = String(args.id);
+      const job = sched.list().find((j) => j.id === id && j.personId === ctx.personId);
+      if (!job) return `没找到你的编号 ${id}`;
+      return sched.remove(id) ? `已取消 ${id}` : `没找到编号 ${id}`;
+    },
   });
 }

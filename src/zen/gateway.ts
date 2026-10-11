@@ -39,7 +39,13 @@ const readBody = (req: IncomingMessage, limit = 8e6): Promise<any> =>
       buf += c;
       if (buf.length > limit) { try { req.destroy(); } catch { /* ignore */ } finish({}); }
     });
-    req.on('end', () => { try { finish(buf ? JSON.parse(buf) : {}); } catch { finish({}); } });
+    req.on('end', () => {
+      try {
+        // JSON.parse('null') 得到 null：以前直接往下传，路由里读 body.model 就 500
+        const v = buf ? JSON.parse(buf) : {};
+        finish(v && typeof v === 'object' ? v : {});
+      } catch { finish({}); }
+    });
     req.on('error', () => finish({}));
     req.on('close', () => finish({}));
   });
@@ -85,7 +91,11 @@ export function createZenGate(opts: ZenGateOptions = {}): { server: Server; lane
             },
           });
         }
-        const t0 = Date.now();
+        // ⚠️ 以前是 `signal: req.destroyed ? undefined : undefined` —— 永远 undefined，
+        //    客户端断开后上游请求还在跑到底，白烧配额。现在用 AbortController 接 res 的 close。
+        const ac = new AbortController();
+        const onClose = () => ac.abort();
+        res.on('close', onClose);
         try {
           const r = await lane.chat({
             model: String(body.model ?? ''),
@@ -95,7 +105,7 @@ export function createZenGate(opts: ZenGateOptions = {}): { server: Server; lane
             temperature: body.temperature,
             sessionSeed: String(body.user ?? body.session_seed ?? 'global'),
             turnSeed: body.turn_seed,
-            signal: req.destroyed ? undefined : undefined,
+            signal: ac.signal,
           });
           return json(res, 200, {
             id: `chatcmpl-zen-${Date.now().toString(36)}`,
@@ -115,6 +125,8 @@ export function createZenGate(opts: ZenGateOptions = {}): { server: Server; lane
           });
         } catch (err) {
           return sendUpstreamError(res, err);
+        } finally {
+          res.off('close', onClose);
         }
       }
 

@@ -55,6 +55,9 @@ export interface McpServerConfig {
 
 const PROTOCOL_VERSION = '2025-06-18';
 
+/** 异常消息：非 Error 抛出（字符串/对象）也能显示出来，别顶着 "undefined" 调试 */
+const errText = (e: unknown): string => (e as Error)?.message ?? String(e);
+
 /** JSON-RPC 消息类型 */
 type RpcMsg = { jsonrpc: '2.0'; id?: number | string; method?: string; result?: unknown; error?: { code: number; message: string } };
 
@@ -120,6 +123,26 @@ class McpConnection {
     this.#waits.clear();
     this.#buf = '';
 
+    // ⚠️ 握手失败必须**自己收尸**：以前 initialize 抛错后直接往外扔，
+    //    子进程还活着、连接对象还留在 McpManager 的 #conns 里 →
+    //    connected=true → 以后每次 applyAll 都在 `if (this.connected) return` 短路，
+    //    永远不再重连，同时漏一个（或几个）孤儿进程。这里统一 try 起来，失败即清理。
+    try {
+      await this.#handshake();
+    } catch (err) {
+      this.#killChild();
+      this.#sseAbort?.abort();
+      this.#ssePostUrl = undefined;
+      this.#httpUp = false;
+      this.#waits.clear();
+      this.#sseWaiters.clear();
+      this.lastError = errText(err).slice(0, 200);
+      throw err;
+    }
+  }
+
+  /** 真握手（stdio / http / sse 三条路） */
+  async #handshake(): Promise<void> {
     // ── HTTP+SSE（2024-11 旧协议）──
     if (this.mode === 'sse') {
       await this.#sseConnect();
@@ -244,7 +267,7 @@ class McpConnection {
     if (!res.ok || !res.body) throw new Error(`SSE 连接失败：HTTP ${res.status}`);
 
     // endpoint 事件到来之前没法发请求 → 等它（最多 10s）
-    await new Promise<void>((resolve, reject) => {
+    const ready = new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('SSE 服务器 10s 内没发 endpoint 事件')), 10_000);
       timer.unref?.();
       const reader = res.body!.getReader();
@@ -289,6 +312,9 @@ class McpConnection {
         reader.cancel().catch(() => {});
       });
     });
+    // ⚠️ 等 endpoint 超时/失败时只 reject 是不够的：那条 GET 长连接还在读，pump 永远不结束。
+    //    顺手 abort 掉，否则每次探测失败都漏一条 SSE 连接 + 一个 abort 监听器。
+    try { await ready; } catch (err) { this.#sseAbort?.abort(); throw err; }
   }
 
   /** HTTP+SSE 上的一次请求：POST 到 endpoint，响应从 GET 的 SSE 流里按 id 回来 */
@@ -413,6 +439,23 @@ class McpConnection {
     return { ok: true, text: text || '（无返回内容）', isError: Boolean(res?.isError) };
   }
 
+  /**
+   * 收掉子进程并确认它真的死了。
+   * ⚠️ 以前只 `proc.kill()`（SIGTERM）就不管了：npx/脚本包装出来的孙进程不会跟着退，
+   *    stop() 之后进程表里还挂着一串，重启 MCP 服务器时端口/profile 被占。
+   *    现在：先 SIGTERM，1s 后还活着就 SIGKILL；已退出的直接放过。
+   */
+  #killChild(): void {
+    const proc = this.#proc;
+    this.#proc = null;
+    if (!proc || proc.exitCode !== null || proc.signalCode) return;
+    try { proc.kill('SIGTERM'); } catch { return; }
+    const timer = setTimeout(() => {
+      try { if (proc.exitCode === null) proc.kill('SIGKILL'); } catch { /* 已经没了 */ }
+    }, 1000);
+    timer.unref?.();
+  }
+
   stop(): void {
     if (this.mode === 'sse') {
       try { this.#sseAbort?.abort(); } catch { /* ignore */ }
@@ -433,8 +476,7 @@ class McpConnection {
       this.#sessionId = undefined;
       return;
     }
-    try { this.#proc?.kill(); } catch { /* ignore */ }
-    this.#proc = null;
+    this.#killChild();
     for (const w of this.#waits.values()) w({ jsonrpc: '2.0', error: { code: -1, message: '已关闭' } });
     this.#waits.clear();
   }
@@ -480,9 +522,14 @@ export class McpManager {
           await this.attach(conn);
           this.#log(`[mcp] ${cfg.id} 已连接（${conn.mode}），挂载 ${await this.countTools(conn)} 个工具（audience=${JSON.stringify(cfg.audience ?? ['reply', 'sub'])}）`);
         } catch (err) {
+          // ⚠️ 失败后必须把这条连接**摘掉**：以前只记日志、conn 还留在 #conns 里，
+          //    而 start() 失败时它可能已经被标成 connected=true → 以后每次 applyAll
+          //    都在 `if (this.connected) return` 短路，再也重连不上，白留一段内存。
+          this.detach(cfg.id);
+          conn.stop();
+          this.#conns.delete(cfg.id);
           // 自动探测：Streamable HTTP 握手失败 → 退到旧版 HTTP+SSE 再试一次（2024-11 协议还有一堆服务器在用）
           if (conn.autoDetect && conn.mode === 'http') {
-            this.detach(cfg.id); conn.stop(); this.#conns.delete(cfg.id);
             const alt = new McpConnection({ ...cfg, transport: 'sse' });
             this.#conns.set(cfg.id, alt);
             try {
@@ -491,10 +538,13 @@ export class McpManager {
               this.#log(`[mcp] ${cfg.id} Streamable HTTP 不通，已退到 HTTP+SSE，挂载 ${await this.countTools(alt)} 个工具`);
               continue;
             } catch (err2) {
-              this.#log(`[mcp] ${cfg.id} SSE 也不通：${(err2 as Error).message}`);
+              this.detach(cfg.id);
+              alt.stop();
+              this.#conns.delete(cfg.id);
+              this.#log(`[mcp] ${cfg.id} SSE 也不通：${errText(err2)}`);
             }
           }
-          this.#log(`[mcp] ${cfg.id} 连接失败：${(err as Error).message}`);
+          this.#log(`[mcp] ${cfg.id} 连接失败：${errText(err)}`);
         }
       }
     }

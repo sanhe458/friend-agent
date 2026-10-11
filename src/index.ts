@@ -1,6 +1,12 @@
 import type { LogEntry } from './app.ts';
 import { createApp } from './app.ts';
 import { CliAdapter } from './adapters/cli.ts';
+import { installShutdown, setShutdownLogger } from './shutdown.ts';
+
+// createApp() 内部会登记「停适配器/定时器/MCP 子进程/关库」的收尾动作，
+// 这里只补信号安装 + 日志出口，保证 Ctrl+C / systemd stop 能干脆退出。
+setShutdownLogger((s) => console.log(s));
+installShutdown();
 
 const app = createApp();
 const settle = (ms = 400) => new Promise<void>((r) => setTimeout(r, ms));

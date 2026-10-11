@@ -96,10 +96,18 @@ async function once(opts: {
 /**
  * 端点是不是明确“不接受 tools”。
  * 只有这种情况才该去掉工具重试——超时/429/5xx 不算（那只会让本来就吃力的端点再挨一下）。
+ *
+ * ⚠️ 以前的正则太松：`/tool|function_?call|.../` 只要错误体里**出现过** "tool" 就算命中，
+ *    而很多 4xx/5xx 的响应体会把请求原样回显（里面就有 `"tools": [...]`）——
+ *    于是"服务端 500"被误判成"不支持 tools"，静默去掉工具重试一次。
+ *    现在要求错误信息里是「tools 不被支持」这类明确措辞。
  */
 function looksLikeToolsUnsupported(err: unknown): boolean {
   const m = String((err as Error)?.message ?? '').toLowerCase();
-  return /tool|function_?call|tool_choice|unsupported|not support|does not support/.test(m);
+  if (!m) return false;
+  return /(tools?|function[_ ]?calls?(?:_choice)?|tool_choice)\s+(is\s+)?(not\s+supported|unsupported|not\s+available|not\s+implemented|not\s+allowed)/.test(m)
+    || /(does not support|doesn'?t support|not support)\s+(tools?|function[_ ]?calls?)/.test(m)
+    || /tools?\s+are\s+not\s+supported/.test(m);
 }
 
 /** 带 tools 的调用；**只在端点明确不支持 tools 时**才降级重试一次 */

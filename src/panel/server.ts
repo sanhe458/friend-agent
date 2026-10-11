@@ -12,10 +12,23 @@ import { createMetasoSearch } from '../tools/metaso.ts';
 import {
   getApp, holder, models, onSwap, reloadConfig, restartProcess, runtimeInfo, watchConfig,
 } from '../runtime.ts';
+import { installShutdown, onShutdown, setShutdownLogger } from '../shutdown.ts';
 
 // App 会被热重载整体替换：这里保持引用同步
 let app = getApp();
 onSwap((next) => { app = next; });
+
+// ── 收尾（必须第一个登记：先关 HTTP server 停止新请求，再让 App 停适配器/子进程）──
+// ⚠️ 以前没有这段：SIGTERM 后 server 还听着端口，systemd restart 起的新进程抢不到端口，
+//    旧进程又因为一堆 interval/长连接退不出去，只能等超时 SIGKILL。
+onShutdown(() => new Promise<void>((resolve) => {
+  try {
+    server.close(() => resolve());
+    setTimeout(() => resolve(), 2000).unref(); // 没活跃连接时回调可能不触发，别卡住退出
+  } catch { resolve(); }
+}));
+setShutdownLogger((s) => getApp().log.push({ at: Date.now(), dir: 'sys', channel: '-', text: s }));
+installShutdown();
 
 const html = readFileSync(fileURLToPath(new URL('./panel.html', import.meta.url)), 'utf8');
 const chatHtml = readFileSync(fileURLToPath(new URL('./chat.html', import.meta.url)), 'utf8');
@@ -42,7 +55,15 @@ const readBody = (req: IncomingMessage): Promise<any> =>
       buf += c;
       if (buf.length > 1e6) { try { req.destroy(); } catch { /* ignore */ } finish({}); }
     });
-    req.on('end', () => { try { finish(buf ? JSON.parse(buf) : {}); } catch { finish({}); } });
+    req.on('end', () => {
+      try {
+        // ⚠️ `JSON.parse('null')` 拿到的是 null（'0' / '"x"' 也都能过），
+        //    以前直接把它当对象往下传 → 路由里读 b.text 就 TypeError → 500。
+        //    现在统一归一成「对象或 {}」，让路由自己返回 400。
+        const v = buf ? JSON.parse(buf) : {};
+        finish(v && typeof v === 'object' ? v : {});
+      } catch { finish({}); }
+    });
     req.on('error', () => finish({}));
     req.on('close', () => finish({}));
   });
@@ -78,18 +99,39 @@ function isLoopback(req: IncomingMessage): boolean {
   return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
 }
 
+/** token 爆破防护：同一来源连续错这么多次就关一会儿小黑屋 */
+const AUTH_FAIL_LIMIT = 20;
+const AUTH_LOCKOUT_MS = 5 * 60_000;
+const authFails = new Map<string, { n: number; until: number }>();
+
 /**
  * 面板公网可达（listen 0.0.0.0）：token 是唯一门禁。
  *
  * ⚠️ 之前是「没配 token 就一律放行」——而 panelToken 默认是空的，
  *    面板又监听 0.0.0.0，等于**默认装完就是一个公网的、能改 API key、
  *    能替机器人发消息的后台**。现在改为：没配 token 时**只允许本机访问**。
+ *
+ * ⚠️ token 只从请求头读：以前还收 `?token=`（查询串）—— 那会让 token 落进
+ *    access log / Referer / 浏览器历史，纯攻击面（前端本来就只发头）。
  */
 function authorized(req: IncomingMessage, url: URL): boolean {
   const need = holder.current.panelToken;
   if (!need) return isLoopback(req);
-  const got = req.headers['x-panel-token'] ?? url.searchParams.get('token');
-  return typeof got === 'string' && safeEqual(got, need);
+  const got = req.headers['x-panel-token'];
+  if (typeof got !== 'string') return false;
+  if (!safeEqual(got, need)) {
+    // 失败计数：面板监听 0.0.0.0、没有限流时 token 是可以被在线爆破的。
+    // 一个来源连续错太多次就临时关小黑屋（比"每次立刻回 401"贵得多）。
+    const ip = req.socket.remoteAddress ?? '?';
+    const n = (authFails.get(ip)?.n ?? 0) + 1;
+    authFails.set(ip, { n, until: n >= AUTH_FAIL_LIMIT ? Date.now() + AUTH_LOCKOUT_MS : 0 });
+    if (n === AUTH_FAIL_LIMIT || n === AUTH_FAIL_LIMIT * 5) {
+      console.warn(`[panel] ${ip} 连续 token 校验失败 ${n} 次${n >= AUTH_FAIL_LIMIT ? '，临时锁定' : ''}`);
+    }
+    return false;
+  }
+  authFails.delete(req.socket.remoteAddress ?? '?');
+  return true;
 }
 
 /** 列出 OpenClaw 里可导入的服务商（只给结构，不给 key） */
@@ -118,6 +160,38 @@ const clean = (o: Record<string, unknown>): Record<string, unknown> =>
   Object.fromEntries(Object.entries(o).filter(([, v]) =>
     v !== undefined && v !== null && !(typeof v === 'number' && !Number.isFinite(v))));
 
+/**
+ * 静态资源缓存。
+ * ⚠️ 以前每个请求都 readFileSync + writeHead('no-store')：面板 18 个 JS/CSS/SVG
+ *    在每次开页/每次 5 秒轮询时都被重新读盘，浏览器也永远不缓存。
+ *    public/ 下的文件是随代码走的（改了要重启进程才生效），启动时读一遍就够。
+ */
+const assetCache = new Map<string, { buf: Buffer; type: string; mtimeMs: number }>();
+
+const extType = (rel: string): string =>
+  rel.endsWith('.css') ? 'text/css; charset=utf-8'
+    : rel.endsWith('.js') ? 'application/javascript; charset=utf-8'
+    : rel.endsWith('.html') ? 'text/html; charset=utf-8'
+    : rel.endsWith('.svg') ? 'image/svg+xml'
+    : rel.endsWith('.png') ? 'image/png'
+    : 'text/plain; charset=utf-8';
+
+function asset(rel: string): { buf: Buffer; type: string } | undefined {
+  const hit = assetCache.get(rel);
+  if (hit) return { buf: hit.buf, type: hit.type };
+  try {
+    const abs = fileURLToPath(new URL('./public/' + rel, import.meta.url));
+    const root = fileURLToPath(new URL('./public/', import.meta.url));
+    if (!abs.startsWith(root)) return undefined;
+    const buf = readFileSync(abs);
+    const entry = { buf, type: extType(rel), mtimeMs: 0 };
+    assetCache.set(rel, entry);
+    return { buf, type: entry.type };
+  } catch {
+    return undefined;
+  }
+}
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const p = url.pathname;
@@ -132,23 +206,15 @@ const server = createServer(async (req, res) => {
       if (!rel || rel.includes('..') || !/\.(css|js|html|map|svg|png|ico)$/i.test(rel)) {
         return json(res, 400, { error: 'bad path' });
       }
-      try {
-        const abs = fileURLToPath(new URL('./public/' + rel, import.meta.url));
-        // 解析后必须仍在 public/ 目录内
-        const root = fileURLToPath(new URL('./public/', import.meta.url));
-        if (!abs.startsWith(root)) return json(res, 403, { error: 'forbidden' });
-        const buf = readFileSync(abs);
-        const type = rel.endsWith('.css') ? 'text/css; charset=utf-8'
-          : rel.endsWith('.js') ? 'application/javascript; charset=utf-8'
-          : rel.endsWith('.html') ? 'text/html; charset=utf-8'
-          : rel.endsWith('.svg') ? 'image/svg+xml'
-          : rel.endsWith('.png') ? 'image/png'
-          : 'text/plain; charset=utf-8';
-        res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-store' });
-        return void res.end(buf);
-      } catch {
-        return json(res, 404, { error: 'not found' });
-      }
+      const hit = asset(rel);
+      if (!hit) return json(res, 404, { error: 'not found' });
+      res.writeHead(200, {
+        'Content-Type': hit.type,
+        // 文件随代码走、改完要重启才生效：可以放心让浏览器缓存（省掉每轮询一次的读盘）
+        'Cache-Control': 'max-age=3600',
+        'X-Content-Type-Options': 'nosniff',
+      });
+      return void res.end(hit.buf);
     }
 
     if (req.method === 'GET' && (p === '/' || p === '/index.html')) {
@@ -165,16 +231,19 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'GET' && p === '/favicon.ico') {
       // 直接把 SVG 源按 image/svg+xml 回（panel.html 里也有 <link rel="icon"> 指向 /panel/favicon.svg）
-      try {
-        const buf = readFileSync(fileURLToPath(new URL('./public/favicon.svg', import.meta.url)));
-        res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'max-age=3600' });
-        return void res.end(buf);
-      } catch {
-        return json(res, 404, { error: 'not found' });
-      }
+      const hit = asset('favicon.svg');
+      if (!hit) return json(res, 404, { error: 'not found' });
+      res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'max-age=3600' });
+      return void res.end(hit.buf);
     }
 
     if (p.startsWith('/api/') && !authorized(req, url)) {
+      // lockout：这类请求直接回 429，别让攻击者拿 401 当"还有戏"的信号
+      const f = authFails.get(req.socket.remoteAddress ?? '?');
+      if (f && f.until > Date.now()) {
+        res.writeHead(429, { 'Content-Type': 'application/json; charset=utf-8', 'Retry-After': String(Math.ceil((f.until - Date.now()) / 1000)) });
+        return void res.end(JSON.stringify({ error: 'too many attempts', needToken: true }));
+      }
       return json(res, 401, { error: 'unauthorized', needToken: true });
     }
 
@@ -186,15 +255,19 @@ const server = createServer(async (req, res) => {
         bindings: person.bindings,
         preferredChannel: person.preferredChannel,
         personaId: (person as unknown as { personaId?: string }).personaId,
-        memoryCount: app.memory.all(person.id).length,
+        // ⚠️ 以前是 memory.all(pid).length —— all() 会把每条记忆（含向量）浅拷贝一遍，
+        //    而这里只要个数。面板每 5 秒拉一次，人多的时候纯浪费。
+        memoryCount: app.memory.count(person.id),
         taskCount: app.orch.list(person.id).length,
       }));
       const mcpStatus = app.mcp.status();
+      const allTasks = app.orch.all();
+      const jobs = app.sched.list();
       return json(res, 200, {
         time: Date.now(),
         counts: {
           persons: persons.length,
-          tasks: app.orch.all().length,
+          tasks: allTasks.length,
           memories: persons.reduce((n, x) => n + x.memoryCount, 0),
           tools: app.tools.list().length,
         },
@@ -203,9 +276,10 @@ const server = createServer(async (req, res) => {
         specialists: app.orch.specialists(),
         tools: app.tools.list().map((t) => ({ name: t.name, description: t.description, timeoutMs: t.timeoutMs })),
         log: app.log.slice(-200),
-        tasks: app.orch.all(),
+        tasks: allTasks,
         // 概览页的摘要 tiles（定时任务 / MCP），不用每个页面再单独拉
-        jobs: { total: app.sched.list().length, enabled: app.sched.list().filter((j) => j.enabled).length },
+        // ⚠️ 以前 sched.list() 被调了两次（还各带一次数组构造）
+        jobs: { total: jobs.length, enabled: jobs.filter((j) => j.enabled).length },
         mcp: {
           servers: mcpStatus.length,
           connected: mcpStatus.filter((s) => s.connected).length,
@@ -555,6 +629,13 @@ const server = createServer(async (req, res) => {
         const id = String(s?.id ?? '').trim();
         const command = String(s?.command ?? '').trim();
         if (!id || !command) continue;
+        // id 是配置里的唯一键，也是工具名前缀（mcp_<id>_xxx）的来源。
+        // ⚠️ 带路径分隔符/空白的 id 存进来只会变成看不懂的前缀、客户端也连不上。
+        //    实测过一次：表单把 id 和 args 粘成一整个路径静默存了进来，连接一直超时，
+        //    面板上只显示"断开"，查了半天才看出 id 是坏的。现在直接拒。
+        if (!/^[A-Za-z0-9_.-]+$/.test(id)) {
+          return json(res, 400, { error: `MCP 服务器 ID 含非法字符（只允许字母/数字/._-）：${id.slice(0, 60)}` });
+        }
         if (seen.has(id)) continue; // id 重复丢弃，别静默覆盖
         seen.add(id);
         const aud = Array.isArray(s.audience)

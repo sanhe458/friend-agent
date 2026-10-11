@@ -4,7 +4,11 @@
  *   □ 回复模型（reply）  □ 子 agent（sub）—— 都不勾 = 都能用
  */
 async function renderMcp(v) {
+  // ⚠️ 和别的页面保持一致：异步回来先确认还在这个 tab / 还是同一个 #view。
+  //    以前这里没这道判定 —— 请求飞着的时候切到别的页面，回来就把新页面覆盖掉。
+  if (typeof TAB !== 'undefined' && (TAB !== 'mcp' || v !== document.getElementById('view'))) return;
   const d = await api('/api/mcp');
+  if (typeof TAB !== 'undefined' && (TAB !== 'mcp' || v !== document.getElementById('view'))) return;
   const servers = d.servers || [];
   const status = {};
   (d.status || []).forEach((s) => { status[s.id] = s; });
@@ -68,6 +72,13 @@ async function renderMcp(v) {
         const id = $('#ms-id').value.trim();
         const command = $('#ms-cmd').value.trim();
         if (!id || !command) { toast('✗ ID 和启动命令必填'); return false; }
+        // id 会变成工具名前缀（mcp_<id>_xxx），也进配置当唯一键：
+        // 带路径/空格的 id 存进去只会得到一个看不懂的前缀 + 连不上。直接拦下。
+        // （以前是静默存坏配置，面板上只显示"断开"，非常难查）
+        if (!/^[A-Za-z0-9_.-]+$/.test(id)) {
+          toast('✗ ID 只能有字母/数字/._-（不能带路径或空格）');
+          return false;
+        }
         const others = servers.filter((x) => x.id !== id);
         const entry = {
           id,

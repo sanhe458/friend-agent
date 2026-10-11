@@ -97,6 +97,12 @@ export class ModelRegistry {
       });
       return { ok: true, ms: r.ms, text: `嵌入成功：维度 ${r.dims}` };
     }
+    if (kind === 'jev') {
+      // Jev 型 System One 判定模型：它压根不接受 chat 请求（只答 choice/score/noul），
+      // 以前这里按 chat 打一次，用户看到的是上游一句莫名其妙的 400。
+      // 如实说明它在哪测（Zen 网关的 /v1/systemone 专线）。
+      throw new Error('jev 是 System One 判定模型，不走 chat 接口：请在 Zen 网关里用 /v1/systemone 测（或直接用它自己的 endpoint）');
+    }
     if (kind === 'rerank') {
       const r = await rerank({
         baseUrl: provider.baseUrl, apiKey: provider.apiKey, model: model.model,

@@ -21,6 +21,8 @@ export class IdentityService {
   /** channel:externalId → personId（find 别每次线性扫全部人） */
   #index = new Map<string, string>();
   #persist?: Persistence;
+  /** person 被合并/删除时的回调（让引擎之类的模块清掉自己的分片状态） */
+  #onForget = new Set<(personId: string) => void>();
 
   constructor(persist?: Persistence) {
     this.#persist = persist;
@@ -33,6 +35,12 @@ export class IdentityService {
   }
 
   #save(p: Person): void { this.#persist?.savePerson(p); }
+
+  /** 订阅「person 没了」事件（合并后被删的临时身份、面板删除的人） */
+  onForget(fn: (personId: string) => void): () => void {
+    this.#onForget.add(fn);
+    return () => { this.#onForget.delete(fn); };
+  }
 
   /** 把绑定记进索引（合并/建档后都要调） */
   #indexAdd(personId: string, b: Binding): void { this.#index.set(`${b.channel}:${b.externalId}`, personId); }
@@ -47,6 +55,9 @@ export class IdentityService {
 
   /** 未知身份自动建档；已知则直接返回。name 只在“还没被起过名”时生效，不会覆盖人工/AI 起的称呼 */
   resolve(channel: ChannelId, externalId: string, name?: string): Person {
+    // 顺手清一次过期/用尽的验证码（以前只在 requestMerge 里清：没人发起合并时，
+    // 它们会一直躺在 #pending 里）。这条路径每条入站消息都会走，代价≈0。
+    this.#sweep();
     const found = this.find(channel, externalId);
     if (found) {
       // 仍是 channel:externalId 这种机器串 → 用通道自带的名字补上可读的
@@ -171,6 +182,9 @@ export class IdentityService {
       if (orphan.bindings.length === 0) {
         this.#people.delete(orphan.id);
         this.#persist?.deletePerson(orphan.id);
+        // 被合并掉的临时身份在别处还留着痕迹：引擎的历史/事件、每日翻篇的日期标记。
+        // 不清理的话每次合并都漏一份（合并越多漏越多，而且是永久的内存泄漏）。
+        for (const fn of this.#onForget) { try { fn(orphan.id); } catch { /* ignore */ } }
       } else {
         this.#save(orphan); // 还剩别的绑定，得把删掉的那条写回去
       }

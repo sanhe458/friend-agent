@@ -2,6 +2,9 @@ import { join } from 'node:path';
 import type { Harness } from '../harness/types.ts';
 import type { Task, TaskEvent, TaskRunner } from './types.ts';
 
+/** 异常消息：非 Error 抛出（字符串/对象）也别顶着 "undefined" 调试 */
+const errText = (e: unknown): string => (e as Error)?.message ?? String(e);
+
 export interface SpecialistModel {
   providerId: string;
   model: string;
@@ -141,11 +144,11 @@ export function makeRunner(opts: {
       runOn(opts.harness, task.prompt)
         .catch(async (err) => {
           if (!opts.fallback) throw err;
-          emit({ taskId: task.id, kind: 'progress', progress, text: `主 harness 失败，回退 local：${(err as Error).message}` });
+          emit({ taskId: task.id, kind: 'progress', progress, text: `主 harness 失败，回退 local：${errText(err)}` });
           return runOn(opts.fallback, task.prompt);
         })
         .then((r) => emit({ taskId: task.id, kind: 'done', text: r.text || '（没有产出）' }))
-        .catch((err) => emit({ taskId: task.id, kind: 'done', text: `子 agent 失败：${(err as Error).message}` }));
+        .catch((err) => emit({ taskId: task.id, kind: 'done', text: `子 agent 失败：${errText(err)}` }));
       return;
     }
 
@@ -170,7 +173,7 @@ export function makeRunner(opts: {
             return;
           }
         } catch (err) {
-          emit({ taskId: task.id, kind: 'progress', progress, text: `第 ${i} 段出错：${(err as Error).message}` });
+          emit({ taskId: task.id, kind: 'progress', progress, text: `第 ${i} 段出错：${errText(err)}` });
         }
       }
       emit({

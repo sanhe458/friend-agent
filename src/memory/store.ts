@@ -38,6 +38,13 @@ export interface MemoryModelDeps {
  */
 const MEMORY_LIMIT_PER_PERSON = 300;
 
+/**
+ * 启动补算向量时，每个人最多补多少条（取最近这些）。
+ * 补算是「锦上添花」：老条目没有向量只是少一路召回，关键词路照样工作。
+ * 全量补算会让新记忆排几小时的队（详见 #backfillAll）。
+ */
+const BACKFILL_LIMIT_PER_PERSON = 200;
+
 /** 两路召回各取多少条进候选池，再交给融合/精排 */
 const CANDIDATE_POOL = 20;
 
@@ -74,8 +81,10 @@ export class MemoryStore {
   #byPerson = new Map<string, MemoryItem[]>();
   #persist?: Persistence;
   #deps: MemoryModelDeps;
-  /** 串行嵌入队列：写入/重算的向量任务一条条来，不打爆提供商 */
-  #chain: Promise<void> = Promise.resolve();
+  /** 待算向量的记忆对象集合（去重 + 顺序保证） */
+  #pending = new Set<MemoryItem>();
+  /** 补算是否正在跑 */
+  #draining = false;
 
   constructor(persist?: Persistence, deps: MemoryModelDeps = {}) {
     this.#persist = persist;
@@ -105,11 +114,37 @@ export class MemoryStore {
       list.splice(0, list.length - MEMORY_LIMIT_PER_PERSON);
     }
     this.#byPerson.set(personId, list);
+    this.#personOf.set(item, personId);
     const id = this.#persist?.saveMemory(personId, item);
     if (id != null) item.id = id;
     // 有嵌入模型就后台补向量：write 保持同步（调用点不用 await），召回晚一点就绪没关系
     this.#enqueueVec(item);
     return item;
+  }
+
+  /**
+   * 只要条数（面板 /api/state 每 5 秒拉一次）。
+   * ⚠️ 以前那里用的是 `all(pid).length` —— all() 会把每条记忆浅拷贝一遍
+   *    （含 vec/标签），人多的时候纯浪费。count() 只读长度。
+   */
+  count(personId: string): number {
+    return this.#byPerson.get(personId)?.length ?? 0;
+  }
+
+  /** personId → 已写入的记忆对象（forget 时用来把待算向量的队列也清干净） */
+  #personOf = new Map<MemoryItem, string>();
+
+  /**
+   * 丢掉这个 person 在内存里的全部记忆（人被合并/删除时调）。
+   * 库里的行由 deletePerson 的级联删除负责。
+   */
+  forgetPerson(personId: string): void {
+    this.#byPerson.delete(personId);
+    // 待算向量的队列里也可能有这个人的条目：不清的话它们算完还会
+    // saveMemoryVec 往一条已经不存在的行上写（白打一次 embedding 请求）。
+    for (const [item, pid] of this.#personOf) {
+      if (pid === personId) { this.#pending.delete(item); this.#personOf.delete(item); }
+    }
   }
 
   /**
@@ -121,8 +156,11 @@ export class MemoryStore {
     const list = this.#byPerson.get(personId) ?? [];
     const i = list.findIndex((it) => it.id === id);
     if (i < 0) return false;
-    list.splice(i, 1);
+    const [gone] = list.splice(i, 1);
     this.#byPerson.set(personId, list);
+    // 待算向量的队列里如果还有它，一并清掉（否则算完会往已删的行上写）
+    this.#pending.delete(gone);
+    this.#personOf.delete(gone);
     return this.#persist?.deleteMemory(personId, id) ?? true;
   }
 
@@ -272,22 +310,52 @@ export class MemoryStore {
     }
   }
 
-  /** 给所有「没向量 / 模型不匹配」的记忆排队补算（启动时自动跑一次） */
+  /** 给「没向量 / 模型不匹配」的记忆排队补算（启动时自动跑一次） */
   #backfillAll(): void {
     const eCfg = this.#deps.embedding?.();
     if (!eCfg) return;
+    // ⚠️ 以前是全量入队：老库里几千条、每小时一个 embedding 请求的话
+    //    队列要排几小时，而 write() 的新任务是**排在尾巴上**的 ——
+    //    于是今天刚记的东西反而没有向量、参与不了向量召回（静默降级）。
+    //    现在：每人只补最近的 N 条（召回本来也只能翻出这些），新任务走优先级通道。
+    let queued = 0;
     for (const list of this.#byPerson.values()) {
-      for (const it of list) {
-        if (!it.vec || it.vecModel !== eCfg.model) this.#enqueueVec(it);
+      const todo = list.filter((it) => !it.vec || it.vecModel !== eCfg.model);
+      for (const it of todo.slice(-BACKFILL_LIMIT_PER_PERSON)) {
+        this.#pending.add(it);
+        queued += 1;
       }
+    }
+    if (queued) void this.#drainBackfill();
+  }
+
+  async #drainBackfill(): Promise<void> {
+    if (this.#draining) return;
+    this.#draining = true;
+    try {
+      // while 而不是 for：补算过程中新写入的记忆也会进 #pending，
+      // 一把扫到尾才不至于让它们躺到下一次 write() 才被处理。
+      let guard = 0;
+      while (this.#pending.size && guard++ < 10_000) {
+        const it = this.#pending.values().next().value as MemoryItem;
+        this.#pending.delete(it);
+        await this.#embedOne(it).catch(() => { /* 一条失败不拖垮队列 */ });
+        // 让出事件循环：补算再久也不能把消息处理堵死
+        await new Promise((r) => setImmediate(r));
+      }
+    } finally {
+      this.#draining = false;
     }
   }
 
   /** 入串行队列：算好向量就地更新内存对象 + 落库；失败静默（下次启动 backfill 会再试） */
   #enqueueVec(item: MemoryItem): void {
-    this.#chain = this.#chain
-      .then(() => this.#embedOne(item))
-      .catch(() => { /* 一条失败不拖垮队列 */ });
+    if (!item.text) return;
+    // 同一对象重复入队毫无意义（面板连点/重复写入都会），去重
+    if (this.#pending.has(item)) return;
+    this.#pending.add(item);
+    // 新写的记忆插到最前面：向量早一天算好，召回就早一天准
+    if (!this.#draining) void this.#drainBackfill();
   }
 
   async #embedOne(item: MemoryItem): Promise<void> {

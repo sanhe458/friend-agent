@@ -1,4 +1,5 @@
 import type { Adapter, StreamHandle } from './adapter.ts';
+import { safeEmit } from './adapter.ts';
 import type { Capabilities, Inbound, MediaRef, Outbound } from '../core/types.ts';
 
 /**
@@ -50,6 +51,8 @@ export class TelegramAdapter implements Adapter {
   /** 下载文件（语音等）用的前缀：{apiBase}/file/bot{token} */
   #fileBase: string;
   #emit: ((m: Inbound) => void) | null = null;
+  /** 入站投递：统一走 safeEmit，避免上层 deliver 失败变成 unhandled rejection */
+  #fire(m: Inbound): void { safeEmit(this.#emit, m, this.#log); }
   #stopped = false;
   /** 是否已经在轮询（防止重复 start 造成两个轮询者） */
   #polling = false;
@@ -198,12 +201,14 @@ export class TelegramAdapter implements Adapter {
           const voice = m.voice ?? m.audio; // voice = 语音条，audio = 音频文件
           if (!text && !voice) continue;    // 其他类型（图片等）暂不处理
 
-          this.#lastMsg.set(chatId, Number(m.message_id));
-          this.#rememberMsgTrim();
+          // ⚠️ 授权判定要**先于**任何下载/状态写入：以前先 set #lastMsg 再判 #allowed，
+          //    未授权的 chat 也会触发一次 getFile 网络请求，白名单反而成了"先干活后检查"。
           if (!this.#allowed(chatId)) {
             this.#log(`[tg] 忽略未授权的 chat ${chatId}`);
             continue;
           }
+          this.#lastMsg.set(chatId, Number(m.message_id));
+          this.#rememberMsgTrim();
 
           // 语音 → 下载成字节，以 data URL 塞进 media（上层再做 ASR）
           let media: MediaRef[] | undefined;
@@ -222,7 +227,7 @@ export class TelegramAdapter implements Adapter {
           //    那会让模型收到空 user 输入。改成告知对方语音没收到，让其打字。
           if (!text && !media) {
             if (voice?.file_id) {
-              this.#emit?.({
+              this.#fire({
                 channel: 'telegram',
                 chatType: m.chat?.type === 'private' ? 'private' : 'group',
                 externalId: chatId,
@@ -236,7 +241,7 @@ export class TelegramAdapter implements Adapter {
           const name = m.from?.first_name
             ? String(m.from.first_name) + (m.from.last_name ? ' ' + String(m.from.last_name) : '')
             : (m.from?.username ? '@' + m.from.username : undefined);
-          this.#emit?.({
+          this.#fire({
             channel: 'telegram',
             chatType: m.chat?.type === 'private' ? 'private' : 'group',
             externalId: chatId,

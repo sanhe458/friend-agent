@@ -84,6 +84,10 @@ export function parseCron(spec: string): CronFields | undefined {
 export function nextCronAt(spec: string, from: number): number | undefined {
   const f = parseCron(spec);
   if (!f) return undefined;
+  // ⚠️ 先做可行性预检：`0 0 30 2 *`（2 月 30 日）、`0 0 31 4 *` 这类**永远不可能命中**
+  //    的表达式，以前会老老实实按分钟走完整个 366 天的查找（≈52 万次迭代）——
+  //    而这条路径在工具调用里（add/setEnabled/#fire），等于把整个进程卡死几秒。
+  if (!cronFeasible(f)) return undefined;
   const t = new Date(from + 60_000);
   t.setSeconds(0, 0);
   const limit = from + 366 * 86_400_000;
@@ -98,6 +102,19 @@ export function nextCronAt(spec: string, from: number): number | undefined {
     t.setMinutes(t.getMinutes() + 1);
   }
   return undefined;
+}
+
+/** 这个 cron 表达式的日期部分有没有可能成立（月份里有没有那么一天） */
+function cronFeasible(f: CronFields): boolean {
+  if (!f.mon || !f.dom) return true; // 有 * 就不可能锁死
+  // dom 与 dow 是“或”关系：只要 dow 里有一天就行
+  if (f.dow && f.dow.size) return true;
+  for (const m of f.mon) {
+    // 用闰年（2028）取该月天数：免得把 `0 0 29 2 *` 这种合法表达式误判成不可能
+    const days = new Date(2028, m, 0).getDate();
+    for (const d of f.dom) if (d <= days) return true;
+  }
+  return false;
 }
 
 /**

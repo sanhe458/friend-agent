@@ -71,8 +71,12 @@ export function registerBuiltinTools(
     },
     timeoutMs: 300,
     run: async (args: { text: string; tags?: string[] }, ctx) => {
+      const text = String(args.text ?? '').trim();
+      // ⚠️ 以前不校验：模型/规则桩发个空 text 也能落一条空记忆，
+      //    而 rerank 会过滤掉空串 —— index 错位的根源（详见 models/rerank.ts）。
+      if (!text) return { ok: false, error: 'text 不能为空' };
       memory.write(ctx.personId, {
-        text: args.text,
+        text,
         tags: args.tags ?? ['hot'],
         channel: ctx.channel,
         at: Date.now(),

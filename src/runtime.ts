@@ -61,6 +61,14 @@ function closeOld(old: App | null): void {
   }
   try { old.sched.stop(); }
   catch { /* 定时器停不掉也不影响重建 */ }
+  // ⚠️ MCP 子进程也要收：以前只停适配器/定时器/库 ——
+  //    每改一次配置（面板保存/保存都会触发热重载）就漏一组 stdio 子进程，
+  //    改几十次配置后进程表里挂着一串孤儿 MCP 服务器。
+  try { old.mcp.stopAll(); }
+  catch { /* 收不掉也不影响重建 */ }
+  // 它登记过的进程级收尾动作也摘掉：不然每次热重载都往 shutdown.ts 里
+  // 堆一个指向已废弃 App 的闭包（改几十次配置就几十个）。
+  try { old.unregisterShutdown?.(); } catch { /* ignore */ }
   try { old.persist.close(); }
   catch { /* 旧句柄可能还被在跑的轮次占着，忽略 */ }
 }

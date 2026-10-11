@@ -204,6 +204,13 @@ export function createSqlitePersistence(file: string): Persistence {
     pruneEvts: db.prepare(
       'delete from events where person_id = ? and id <= (select id from events where person_id = ? order by id desc limit 1 offset ?)',
     ),
+    // ⚠️ memories 以前**没有对应的 prune**：内存侧 MEMORY_LIMIT_PER_PERSON=300 有条形天花板，
+    //    库里却全量留着。带向量的行每条 4KB+ BLOB，启动时 loadMemories 全表 order by id
+    //    全量读进来再逐行 new Float32Array，然后在 MemoryStore 构造里把 300 条以外的全扔掉 ——
+    //    白读白解析，老库越大启动越慢。语义与上面两条保持一致（保留最近 KEEP 条）。
+    pruneMem: db.prepare(
+      'delete from memories where person_id = ? and id <= (select id from memories where person_id = ? order by id desc limit 1 offset ?)',
+    ),
     allPersons: db.prepare('select id, display_name, preferred_channel, persona_id, created_at from persons'),
     allBindings: db.prepare('select channel, external_id, person_id, verified_at, display_name from bindings'),
 
@@ -252,10 +259,13 @@ export function createSqlitePersistence(file: string): Persistence {
   // 每人保留多少条（内存里分别是 60 / 400，库里给宽松一点）
   const KEEP_HISTORY = 400;
   const KEEP_EVENTS = 1200;
+  /** 记忆的库里上限（略宽于内存的 300，给「长期记忆」留点余量） */
+  const KEEP_MEMORIES = 500;
   /** 每存 N 条修剪一次：不必要每条都跑 DELETE */
   const PRUNE_EVERY = 25;
   let sinceHistPrune = 0;
   let sinceEvtPrune = 0;
+  let sinceMemPrune = 0;
 
   return {
     enabled: true,
@@ -336,6 +346,10 @@ export function createSqlitePersistence(file: string): Persistence {
 
     saveMemory(personId: string, item: MemoryItem): number {
       const r = q.insMemory.run(personId, item.text, item.tags.join(','), item.channel, item.at, item.hot ? 1 : 0);
+      if (++sinceMemPrune >= PRUNE_EVERY) {
+        sinceMemPrune = 0;
+        try { q.pruneMem.run(personId, personId, KEEP_MEMORIES); } catch { /* 修剪失败不阻塞写入 */ }
+      }
       return Number(r.lastInsertRowid);
     },
 

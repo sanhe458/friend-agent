@@ -5,6 +5,8 @@ let logFilter = 'all';
 let logQuery = '';
 let logPaused = false;
 let logLimit = 200;
+/** 过滤输入的去抖定时器（见 renderLogs 里的 input 监听） */
+let logQueryTimer = 0;
 function renderLogs(v) {
   const all = (ST.state.log || []).slice().reverse();
   const q = logQuery.trim().toLowerCase();
@@ -30,7 +32,13 @@ function renderLogs(v) {
         '<span class="c">' + esc(e.channel || '-') + '</span><span class="x">' + esc(String(e.text || '').slice(0, 400)) + '</span></div>';
     }).join('') : '<div class="empty">' + (q ? '没有匹配「' + esc(logQuery) + '」的日志' : '暂无日志') + '</div>') + '</div></div>';
   $$('#lg-pills button').forEach((b) => b.addEventListener('click', () => { logFilter = b.getAttribute('data-k'); renderLogs(v); }));
-  $('#lg-q').addEventListener('input', (e) => { logQuery = e.target.value; renderLogsKeepFocus(v); });
+  $('#lg-q').addEventListener('input', (e) => {
+    logQuery = e.target.value;
+    // ⚠️ 以前每次按键都整页重建（最多 1000 行 DOM）—— 打字快一点就明显卡。
+    //    加个短去抖；输入框焦点/光标交给 renderLogsKeepFocus 保住。
+    clearTimeout(logQueryTimer);
+    logQueryTimer = setTimeout(() => renderLogsKeepFocus(v), 180);
+  });
   $('#lg-limit').addEventListener('change', (e) => { logLimit = Number(e.target.value); renderLogs(v); });
   $('#lg-pause').addEventListener('click', () => { logPaused = !logPaused; lastLogLen = -1; renderLogs(v); });
 }

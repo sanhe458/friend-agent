@@ -5,6 +5,9 @@ import { compressIfNeeded } from '../context/compress.ts';
 import { dayKey, type DailyContextManager, type RolloverResult } from '../context/daily.ts';
 import type { MemoryStore } from '../memory/store.ts';
 import { chatCompletion, chatStream, type ChatMessage } from '../models/client.ts';
+
+/** 异常消息：非 Error 抛出（字符串/对象）也别顶着 "undefined" 调试 */
+const errText = (e: unknown): string => (e as Error)?.message ?? String(e);
 import type { ModelRegistry } from '../models/registry.ts';
 import type { Orchestrator } from '../orchestrator/orchestrator.ts';
 import type { Persistence } from '../store/persist.ts';
@@ -116,6 +119,16 @@ export class ReplyEngine {
   }
 
   history(personId: string): ChatMessage[] { return [...this.#historyOf(personId)]; }
+
+  /**
+   * 这个 person 没了（合并后被删的临时身份 / 面板删人）→ 清掉内存分片。
+   * ⚠️ 以前没有这一步：合并一次就漏一份 #history/#events，而 history()/transcript()
+   *    还会继续把一个已删除的人的数据提供出去。
+   */
+  forget(personId: string): void {
+    this.#history.delete(personId);
+    this.#events.delete(personId);
+  }
 
   /** 这个人从头到尾的结构化事件流 */
   transcript(personId: string): TurnEvent[] { return [...this.#eventsOf(personId)]; }
@@ -240,6 +253,16 @@ export class ReplyEngine {
     }
 
     // ── 工具循环（每个间隙都是插话点）────────────
+    //
+    // ⚠️ 用户这条历史在**进循环前**就落（原来放在收尾处）：插话是这一轮进行中
+    //    补进来的，只有先把原消息写进去，历史/归档里才是「用户 → 插话 → 助手」
+    //    的正确顺序（以前插话只进模型的 messages，历史里查无此人，
+    //    而回复里又明确说「另外记下你说的」——记录和对话永久分叉）。
+    const hist = this.#historyOf(person.id);
+    const userMsg: ChatMessage = { role: 'user', content: text };
+    hist.push(userMsg);
+    this.#persist?.saveHistory(person.id, userMsg);
+
     let reply = '';
     let visible = ''; // 已经流给用户的累计文本
     let failed = false; // 模型调用失败——失败文案不该进历史（见下方）
@@ -250,8 +273,13 @@ export class ReplyEngine {
       boundary();
       if (injections.length) {
         const extra = injections.splice(0).join('\n');
-        messages.push({ role: 'user', content: `（对方又补了一句）${extra}` });
+        const injText = `（对方又补了一句）${extra}`;
+        messages.push({ role: 'user', content: injText });
         this.#emit(person.id, { kind: 'notice', at: Date.now(), text: `插话并入上下文：${extra}` }, true);
+        // 同步进历史（归档 = 历史翻篇来的），别让插话只活在模型上下文里
+        const injMsg: ChatMessage = { role: 'user', content: injText };
+        hist.push(injMsg);
+        this.#persist?.saveHistory(person.id, injMsg);
       }
 
       const before = visible;
@@ -262,8 +290,8 @@ export class ReplyEngine {
           : await chatCompletion({ ...baseCall, messages });
       } catch (err) {
         failed = true;
-        reply = `（模型调用失败：${(err as Error).message}）`;
-        this.#emit(person.id, { kind: 'error', at: Date.now(), text: `模型调用失败：${(err as Error).message}` }, true);
+        reply = `（模型调用失败：${errText(err)}）`;
+        this.#emit(person.id, { kind: 'error', at: Date.now(), text: `模型调用失败：${errText(err)}` }, true);
         break;
       }
 
@@ -306,7 +334,7 @@ export class ReplyEngine {
             externalId: msg.externalId,
           });
         } catch (err) {
-          out = { error: (err as Error).message };
+          out = { error: errText(err) };
           isErr = true;
         }
         const s = typeof out === 'string' ? out : safeStringify(out);
@@ -338,11 +366,7 @@ export class ReplyEngine {
     // 流式漏掉的尾巴补上（工具往返后最终文本可能与已流出的不同）
     if (onDelta && reply !== visible) onDelta(reply);
 
-    const hist = this.#historyOf(person.id);
-    const userMsg: ChatMessage = { role: 'user', content: text };
     const asMsg: ChatMessage = { role: 'assistant', content: reply };
-    hist.push(userMsg);
-    this.#persist?.saveHistory(person.id, userMsg);
     // ⚠️ 模型调用失败时，reply 是「（模型调用失败：…）」这句提示 ——
     //    以前它会被当成助手的正式回复存进历史，然后**进入后续每一轮的上下文**，污染记忆。
     //    失败就只留用户那条，不把错误文案当回答。
@@ -389,8 +413,14 @@ export class ReplyEngine {
       reply = '嗯？';
     } else if (/^记住/.test(text)) {
       const content = text.replace(/^记住[，,：:\s]*/, '');
-      await this.#tools.call('memory_remember', { text: content, tags: ['user-said'] }, toolCtx);
-      reply = `好，记住了：${content}`;
+      // ⚠️ 只说一个「记住」时 content 是空串：以前照样写一条空记忆进库
+      //    （rerank 过滤空串 → index 错位的那条老 bug 的入口之一）。
+      if (!content.trim()) {
+        reply = '想让我记住什么？说具体一点，比如「记住我不喝咖啡」。';
+      } else {
+        await this.#tools.call('memory_remember', { text: content, tags: ['user-said'] }, toolCtx);
+        reply = `好，记住了：${content}`;
+      }
     } else if (/(浏览器|打开.*网|网页|截图)/.test(text)) {
       boundary();
       const r = (await this.#tools.call('browser', { prompt: text }, toolCtx)) as { taskId: string };

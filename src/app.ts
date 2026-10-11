@@ -36,6 +36,7 @@ import { registerArchiveTool } from './tools/archive.ts';
 import { createPiHarness, type PiProviderEntry } from './harness/pi.ts';
 import { createLocalHarness } from './harness/local.ts';
 import { createSqlitePersistence, type Persistence } from './store/persist.ts';
+import { installShutdown, onShutdown, setShutdownLogger } from './shutdown.ts';
 
 export interface LogEntry {
   at: number;
@@ -68,6 +69,11 @@ export interface App {
   sched: Scheduler;
   /** MCP 连接管理器（外部工具挂载/勾选给谁用） */
   mcp: McpManager;
+  /**
+   * 收掉这个 App 登记过的进程级收尾动作（热重载换实例时调）。
+   * 不调的话每次 reload 都往 shutdown.ts 里堆一个指向旧 App 的闭包。
+   */
+  unregisterShutdown: () => void;
   onLog: (cb: (e: LogEntry) => void) => () => void;
   inbound: (msg: Inbound) => Promise<void>;
   say: (channel: string, externalId: string, text: string) => Promise<void>;
@@ -191,11 +197,22 @@ export function createApp(opts: {
   // ⚠️ McpManager 的 log 收的是 string，得包成 LogEntry——以前直接把 push 传过去，
   //    字符串被塞进 LogEntry[]，面板日志页渲染出 undefined。
   const mcp = new McpManager(tools, (s) => push({ at: Date.now(), dir: 'sys', channel: 'mcp', text: s }));
-  // 退出时收掉 MCP 子进程：不接的话，systemd 重启（SIGTERM）会留下逃逸的孤儿子进程（实测过）
-  const mcpShutdown = () => { try { mcp.stopAll(); } catch { /* ignore */ } };
-  process.once('exit', mcpShutdown);
-  process.once('SIGTERM', mcpShutdown);
-  process.once('SIGINT', mcpShutdown);
+  // ── 进程级收尾（见 src/shutdown.ts）──────────────────────
+  // ⚠️ 以前这里是 `process.once('SIGTERM', mcpShutdown)`：注册信号监听器等于关掉 Node
+  //    的默认退出，而那个处理器只杀了 MCP 子进程 —— 面板 HTTP server、QQ 心跳 interval、
+  //    Telegram 长轮询全都还挂在事件循环上，进程压根不退出。
+  //    于是 systemd restart 只能等超时后 SIGKILL（表现为"重启很慢/新进程抢不到端口"）。
+  //    现在统一登记到 shutdown.ts：信号到了按顺序收适配器/定时器/MCP/库，然后主动退出。
+  setShutdownLogger((s) => push({ at: Date.now(), dir: 'sys', channel: '-', text: s }));
+  installShutdown();
+  const unregisterShutdown = onShutdown(async () => {
+    // 顺序：先停入站来源（适配器），再停定时器/子进程，最后关库
+    for (const a of adapters.all()) { try { await a.stop?.(); } catch { /* 停不掉也要继续收 */ } }
+    try { sched.stop(); } catch { /* ignore */ }
+    // 收 MCP 子进程：不接的话，systemd 重启（SIGTERM）会留下逃逸的孤儿子进程（实测过）
+    try { mcp.stopAll(); } catch { /* ignore */ }
+    try { persist.close(); } catch { /* ignore */ }
+  });
   // 启动就挂；单台失败只记日志，不拖垮主进程（但不能静默吞错——那样连日志都没有）
   mcp.applyAll(getConfig().mcp ?? []).catch((err) => {
     push({ at: Date.now(), dir: 'sys', channel: 'mcp', text: `[mcp] 启动挂载失败：${(err as Error).message}` });
@@ -251,6 +268,15 @@ export function createApp(opts: {
   const adapters = new AdapterRegistry();
   const drafts = new Map<string, string>();
 
+  // person 被合并/删除时，把各模块里按 personId 分片的状态一起清掉
+  // （不清的话每次合并都漏一份内存，且已删除的人还能从面板查到历史）
+  identity.onForget((personId) => {
+    engine.forget(personId);
+    daily.forget(personId);
+    memory.forgetPerson(personId);
+    drafts.delete(personId);
+  });
+
   const deliver = async (out: Outbound, personId?: string) => {
     push({ at: Date.now(), dir: 'out', channel: out.channel, to: out.to, personId, text: out.text });
     try {
@@ -267,7 +293,8 @@ export function createApp(opts: {
     await deliver({ channel, to, text });
   };
 
-  const inbound = async (msg: Inbound) => {
+  /** 入站处理实现；外层 inbound 会兜住异常，保证「一条消息处理失败」不带走进程 */
+  const inboundRaw = async (msg: Inbound) => {
     // ⚡ 归并验证码：在“发起合并的那个对话”里回 6 位数字 → 自动合并，不再走正常回复
     const codeHit = /^\s*(\d{6})\s*$/.exec(msg.text ?? '');
     if (codeHit) {
@@ -390,14 +417,18 @@ export function createApp(opts: {
             : {},
         );
         step(`引擎返回（${out.text.length} 字，to=${out.to}）`);
-        drafts.delete(person.id);
 
         let streamed = false;
         if (handle) {
           try {
             streamed = (await Promise.race([
               handle.end(out.text),
-              new Promise<boolean>((r) => setTimeout(() => r(false), 15_000)),
+              // ⚠️ 这个兜底定时器以前既不 unref 也不 clear：handle.end 正常返回时
+              //    它还在排队，进程要多等 15s 才肯退。现在统一在收尾时清掉。
+              new Promise<boolean>((r) => {
+                const t = setTimeout(() => r(false), 15_000);
+                t.unref();
+              }),
             ])) === true;
             step(`流式收尾：streamed=${streamed}`);
           } catch (err) {
@@ -413,12 +444,36 @@ export function createApp(opts: {
         }
         } finally {
           if (typingTimer) clearInterval(typingTimer);
+          // ⚠️ 必须放 finally：以前只有成功路径才 delete，引擎一抛异常
+          //    （模型挂了/工具崩了）drafts 里就留一条永远"直播中"的草稿。
+          drafts.delete(person.id);
         }
       } catch (err) {
         push({ at: Date.now(), dir: 'sys', channel: msg.channel, personId: person.id, text: `[流程] ❌ 异常：${(err as Error).message.slice(0, 200)}` });
         throw err;
       }
     });
+  };
+
+  /**
+   * 入站总入口（适配器 / 面板 / 演示都走它）。
+   *
+   * ⚠️ 这里必须**自己吃掉异常**：deliver 失败（QQ/TG 返回 429/500、网络断）会一路
+   *    reject 到 adapters/adapter.ts 的 `#emit?.(m)` —— 而那是 `void` 调用，
+   *    没人接的 Promise rejection 在 Node 里默认直接杀进程。
+   *    对一个挂着收消息的服务来说，「回一条消息失败」不该让整个 agent 下线。
+   *    （根因在各调用点修，这里是最后一道闸。）
+   */
+  const inbound = async (msg: Inbound): Promise<void> => {
+    try {
+      await inboundRaw(msg);
+    } catch (err) {
+      const m = (err as Error)?.message ?? String(err);
+      push({
+        at: Date.now(), dir: 'sys', channel: msg.channel, to: msg.externalId,
+        text: `[入站] 处理失败（已隔离，不影响进程）：${m.slice(0, 200)}`,
+      });
+    }
   };
 
   const say = (channel: string, externalId: string, text: string) =>
@@ -509,7 +564,13 @@ export function createApp(opts: {
     const originKnown = person?.bindings.find((b) => b.channel === task.origin.channel);
     const target = originKnown?.channel ?? person?.preferredChannel ?? task.origin.channel;
     const to = person?.bindings.find((b) => b.channel === target)?.externalId ?? task.origin.externalId;
-    void deliver({ channel: target, to, text: `（任务回注·${task.kind}）${e.text}` }, task.personId);
+    // ⚠️ 以前是 `void deliver(...)`：deliver 失败会 reject 而这里没人接 →
+    //    unhandledRejection 把整个进程带走（一条任务回注发不出去 = 服务下线）。
+    void deliver({ channel: target, to, text: `（任务回注·${task.kind}）${e.text}` }, task.personId)
+      .catch((err) => push({
+        at: Date.now(), dir: 'sys', channel: '-', personId: task.personId,
+        text: `[任务回注] 投递失败（不影响任务本身）：${((err as Error)?.message ?? String(err)).slice(0, 200)}`,
+      }));
   });
 
   // ⭐ 真实通道必须**先注册**：否则会被同名 mock 占位遮住，
@@ -561,6 +622,7 @@ export function createApp(opts: {
 
   return {
     identity, memory, queue, orch, tools, models, engine, adapters, log, drafts, persist, sched, mcp,
+    unregisterShutdown,
     ...(qq ? { qq } : {}),
     ...(telegram ? { telegram } : {}),
     onLog: (cb) => { listeners.add(cb); return () => { listeners.delete(cb); }; },

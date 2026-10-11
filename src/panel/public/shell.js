@@ -342,7 +342,10 @@ let lastSig = '', lastTab = '';
 function signature() {
   const s = (ST && ST.state) || {}, r = (ST && ST.runtime) || {}, q = ((ST && ST.qq) || {}).status || {};
   return [
-    (s.log || []).length,
+    // ⚠️ log.length 以前**每个页面**都算进签名：忙的时候随便一条消息就让
+    //    signature() 变化 → 5 秒一次整页重画（滚动位置/输入框全丢）。
+    //    日志页有自己的 3 秒节奏（renderLogsIfOpen），所以这里只在日志页才算它。
+    TAB === 'logs' ? (s.log || []).length : 0,
     (s.persons || []).length,
     (s.tasks || []).map((t) => t.status + (t.progress || 0)).join(','),
     r.runningTurns || 0,
@@ -378,31 +381,43 @@ function userIsTyping() {
 }
 
 async function refresh(opts) {
-  const [state, runtime, qq] = await Promise.all([api('/api/state'), api('/api/runtime'), api('/api/qq')]);
-  // 即使是错误响应也要把 ST 建起来，页面才不至于读空 ST
-  ST = { state: state || {}, runtime: runtime || {}, qq: qq || {} };
-  if (state && state.error) { showGate(); render(); return; }
-  $('#gate').style.display = 'none';
-  const ge = $('#gate-err'); if (ge) ge.style.display = 'none';
-  // ⚠️ 以前这里对每个人**再串行请求一次 /api/chat** 只为数记忆条数 ——
-  //    每人一次重请求（要拉完整事件流+记忆+任务），人一多面板就明显卡。
-  //    /api/state 已经带了 memoryCount，直接用它。
-  const memCount = {};
-  for (const p of (ST.state.persons || [])) memCount[p.id] = p.memoryCount || 0;
-  ST.memCount = memCount;
-  const rt = ST.runtime;
-  $('#sf-pid').textContent = rt.pid || '—';
-  $('#sf-up').textContent = fmtUptime(rt.uptimeMs || 0);
-  const qqS = (ST.qq && ST.qq.status) || {};
-  $('#sf-dot').innerHTML = '<i class="dot ' + (qqS.online ? 'ok' : (rt.persons ? 'busy' : 'off')) + '"></i> ' +
-    (qqS.online ? '在线' : (rt.watching ? '就绪' : '未监听'));
-  lastRefreshAt = Date.now();
-  paintRefreshBtn();
-  if (signature() !== lastSig || TAB !== lastTab) {
-    if (userIsTyping()) { pendingRender = true; } // 输入中：先攒着，失焦再画
-    else render();
+  // ⚠️ 没有 in-flight 防护：5 秒轮询 + 手动刷新按钮叠在一起时，两个请求可能乱序返回，
+  //    先发的后到就把旧数据写进 ST（顶栏 pid/uptime 也一起回跳）。
+  if (refreshing) return;
+  refreshing = true;
+  try {
+    const [state, runtime, qq] = await Promise.all([api('/api/state'), api('/api/runtime'), api('/api/qq')]);
+    // 即使是错误响应也要把 ST 建起来，页面才不至于读空 ST
+    ST = { state: state || {}, runtime: runtime || {}, qq: qq || {} };
+    if (state && state.error) { showGate(); render(); return; }
+    $('#gate').style.display = 'none';
+    const ge = $('#gate-err'); if (ge) ge.style.display = 'none';
+    // ⚠️ 以前这里对每个人**再串行请求一次 /api/chat** 只为数记忆条数 ——
+    //    每人一次重请求（要拉完整事件流+记忆+任务），人一多面板就明显卡。
+    //    /api/state 已经带了 memoryCount，直接用它。
+    const memCount = {};
+    for (const p of (ST.state.persons || [])) memCount[p.id] = p.memoryCount || 0;
+    ST.memCount = memCount;
+    const rt = ST.runtime;
+    $('#sf-pid').textContent = rt.pid || '—';
+    $('#sf-up').textContent = fmtUptime(rt.uptimeMs || 0);
+    const qqS = (ST.qq && ST.qq.status) || {};
+    $('#sf-dot').innerHTML = '<i class="dot ' + (qqS.online ? 'ok' : (rt.persons ? 'busy' : 'off')) + '"></i> ' +
+      (qqS.online ? '在线' : (rt.watching ? '就绪' : '未监听'));
+    lastRefreshAt = Date.now();
+    paintRefreshBtn();
+    if (signature() !== lastSig || TAB !== lastTab) {
+      if (userIsTyping()) { pendingRender = true; } // 输入中：先攒着，失焦再画
+      else render();
+    }
+  } catch (err) {
+    // 轮询失败（网络断了/进程重启中）不该把 unhandled rejection 留在控制台
+    console.warn('refresh failed', err);
+  } finally {
+    refreshing = false;
   }
 }
+let refreshing = false;
 
 /* ── 顶栏刷新按钮 ─────────────────────── */
 let lastRefreshAt = 0;
@@ -414,14 +429,21 @@ setInterval(paintRefreshBtn, 5000);
 $('#top-refresh').addEventListener('click', async () => {
   const ico = document.getElementById('rf-ico');
   if (ico) ico.classList.add('spin');
-  await refresh();
-  toast('✓ 已刷新', 'ok');
-  if (ico) setTimeout(() => ico.classList.remove('spin'), 500);
+  // ⚠️ 以前 remove('spin') 在 await 之后：refresh() 一抛异常（离线/重启中）
+  //    图标就永远转下去。finally 保证一定收。
+  try {
+    await refresh();
+    toast('✓ 已刷新', 'ok');
+  } finally {
+    if (ico) ico.classList.remove('spin');
+  }
 });
 
 /* ── 自动刷新（5s）：后台标签 / 对话页（有自己的 1.2s 节奏）暂停 ── */
 setInterval(() => { if (!document.hidden && TAB !== 'chat') refresh(); }, 5000);
-setInterval(() => { if (TAB === 'chat') tickChat(); }, 1200);
+// ⚠️ 对话页这两个定时器以前不看 document.hidden：切到别的标签页还在每 1.2 秒
+//    拉一次完整对话（整条事件流 + 30 条记忆 + 任务列表），白烧带宽和服务端。
+setInterval(() => { if (TAB === 'chat' && !document.hidden) tickChat(); }, 1200);
 setInterval(renderLogsIfOpen, 3000);
 let lastLogLen = -1;
 function renderLogsIfOpen() {

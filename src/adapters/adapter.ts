@@ -35,9 +35,32 @@ export interface Adapter {
   openStream?(out: Omit<Outbound, 'text'>): Promise<StreamHandle | undefined>;
 }
 
+/**
+ * 把「入站回调」包成不会外泄异常的形式。
+ *
+ * ⚠️ 适配器里都是 `this.#emit?.(msg)` —— 直接丢掉返回的 Promise。
+ *    而入站链路（身份归并回复 / ASR 失败兜话 / 回复引擎）里有几处 `await deliver(...)`
+ *    会 rethrow，于是**通道给的一条消息就能把整个进程带走**（unhandled rejection）。
+ *    所有适配器统一走这里：异常只记日志，绝不让它冒到没人接的地方。
+ */
+export function safeEmit(emit: ((m: Inbound) => void) | null, m: Inbound, log: (s: string) => void): void {
+  if (!emit) return;
+  try {
+    const r = emit(m) as unknown;
+    if (r && typeof (r as Promise<void>).catch === 'function') {
+      (r as Promise<void>).catch((err) => {
+        const msg = (err as Error)?.message ?? String(err);
+        log(`[${m.channel}] 入站处理失败：${msg.slice(0, 200)}`);
+      });
+    }
+  } catch (err) {
+    const msg = (err as Error)?.message ?? String(err);
+    log(`[${m.channel}] 入站处理失败：${msg.slice(0, 200)}`);
+  }
+}
+
 export class AdapterRegistry {
   #map = new Map<string, Adapter>();
-
   add(adapter: Adapter): void {
     if (this.#map.has(adapter.id)) throw new Error(`通道重名: ${adapter.id}`);
     this.#map.set(adapter.id, adapter);

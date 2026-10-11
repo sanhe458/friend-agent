@@ -135,6 +135,52 @@ function fromCatalog(hit: { pid: string; mid: string; m: Record<string, any> }):
 }
 
 /**
+ * metaUrl / 端点地址的安全检查。
+ *
+ * 面板里「元数据端点」是用户随手填的，风险有两层：
+ *   ① SSRF：指向云元数据（169.254.169.254）或内网服务，替别人探活/取数据；
+ *   ② 凭据泄漏：以前不管填什么地址都带上 `Authorization: Bearer <真 key>`。
+ *
+ * 规则（务实优先，别把本机 ollama 这类 http 自建服务Ban掉）：
+ *   - https 任意公网地址：允许；非同源就剥掉 Authorization
+ *   - http：只允许回环/本机（127.0.0.1、localhost、::1、.local）
+ *   - 其它协议 / 私网段 / 链路本地：一律拒
+ *   - 与 provider.baseUrl 同源时保留 Authorization（那是它自己的端点）
+ */
+export function checkMetaUrl(rawUrl: string, providerBaseUrl: string): { ok: boolean; why?: string; sameOrigin: boolean } {
+  let u: URL;
+  try { u = new URL(rawUrl); } catch { return { ok: false, why: 'URL 解析不了', sameOrigin: false }; }
+
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+    return { ok: false, why: `不支持 ${u.protocol} 协议`, sameOrigin: false };
+  }
+  const host = u.hostname.toLowerCase();
+
+  // 回环 / 本机
+  const loopish = host === 'localhost' || host === '::1' || host.endsWith('.local')
+    || /^127(\.\d{1,3}){3}$/.test(host) || host === '0.0.0.0';
+
+  let sameOrigin = false;
+  try {
+    const p = new URL(providerBaseUrl);
+    sameOrigin = p.protocol === u.protocol && p.host.toLowerCase() === host;
+  } catch { /* baseUrl 本身不合法就不算同源 */ }
+
+  if (u.protocol === 'http:' && !loopish) {
+    return { ok: false, why: 'http 只允许本机地址（127.0.0.1/localhost）', sameOrigin: false };
+  }
+  // 回环/本机地址直接放行（ollama、本地 vLLM 这类）：不能让它掉进下面的私网段规则 ——
+  // `^127\.` 本来就在私网段正则里，顺序反了会把本机自建服务全Ban掉。
+  if (loopish) return { ok: true, sameOrigin };
+  // 私网 / 链路本地段：云元数据、K8s 内网、docker 网关都在这里
+  if (/^(10|127)\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)
+    || /^172\.(1[6-9]|2\d|3[01])\./.test(host) || /^\[?f[cd][0-9a-f]{2}:/i.test(host)) {
+    return { ok: false, why: '不允许访问内网/链路本地地址', sameOrigin: false };
+  }
+  return { ok: true, sameOrigin };
+}
+
+/**
  * 取元数据。**真来源只有两个**：服务商端点 → models.dev 目录。
  * 两个都取不到就**如实抛错**（不再有"内置表"这种东西把失败伪装成成功）。
  */
@@ -151,8 +197,14 @@ export async function fetchModelMeta(
 
   // ① 服务商端点（少数端点确实会带上下文/价格）
   for (const u of urls) {
+    // 🛡 SSRF 护栏：metaUrl 是面板里用户填的，以前直接 fetch 还带着真 API key ——
+    //    等于给一个「把我机器的 Bearer 发到任意地址」的口子（169.254.169.254 / 内网服务全reachable）。
+    //    现在：先过安全检查；不是同源地址就**剥掉 Authorization**（公网 https 允许，内网/回环一律拒）。
+    const verdict = checkMetaUrl(u, provider.baseUrl);
+    if (!verdict.ok) { notes.push(`${u} → ${verdict.why}`); continue; }
+    const h = verdict.sameOrigin ? headers : {};
     try {
-      const res = await fetch(u, { headers, signal: AbortSignal.timeout(15_000) });
+      const res = await fetch(u, { headers: h, signal: AbortSignal.timeout(15_000) });
       if (!res.ok) { notes.push(`${u} → HTTP ${res.status}`); continue; }
       const data = (await res.json()) as any;
       const list: any[] = Array.isArray(data) ? data : (data?.data ?? data?.models ?? []);

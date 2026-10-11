@@ -101,8 +101,15 @@ export class ZenLane {
     return out;
   }
 
-  /** 拉上游实时目录；失败就沿用现有目录（静态底表兜底） */
-  async refreshCatalog(): Promise<number> {
+  /** 目录缓存有效期：/v1/models 每个请求都刷新一次上游，20s 的网络等待全压在响应上 */
+  #catalogAt = 0;
+  #catalogTtlMs = 5 * 60_000;
+
+  /** 拉上游实时目录；失败就沿用现有目录（静态底表兜底）。带 TTL 缓存，不会每个请求都打网络 */
+  async refreshCatalog(force = false): Promise<number> {
+    if (!force && this.#catalogAt && Date.now() - this.#catalogAt < this.#catalogTtlMs) {
+      return this.#catalog.length;
+    }
     try {
       const session = await sessionForConversation('catalog:friend-agent');
       let ids: string[] = [];
@@ -120,6 +127,7 @@ export class ZenLane {
       const free = ids.filter((id) => isFreeLane(id));
       if (free.length) {
         this.#catalog = free.map(modelInfo);
+        this.#catalogAt = Date.now();
         return this.#catalog.length;
       }
     } catch { /* 目录拉不到不致命 */ }
@@ -173,7 +181,14 @@ export class ZenLane {
     const requestId = await requestIdFor(session, opts.turnSeed ?? '');
 
     const scrub = new DsmlScrubber();
-    const state = { text: '', reasoning: '', sawTool: false, toolArgs: '' as string, tools: [] as ChatResult['toolCalls'] };
+    // toolSlots: 流里的 tool_call.index/content_block.index → tools 数组下标
+    // toolArgsByIndex: 每个下标的参数增量累加器（index 不同绝不能混在一起）
+    const state = {
+      text: '', reasoning: '', sawTool: false,
+      tools: [] as ChatResult['toolCalls'],
+      toolSlots: new Map<number, number>(),
+      toolArgsByIndex: new Map<number, string>(),
+    };
 
     const t0 = Date.now();
     const usage = await postStreamed({
@@ -283,9 +298,45 @@ export class ZenLane {
     return body;
   }
 
-  /** 解 chat / messages / responses 三种线的一帧 SSE 载荷 */
+  /**
+   * 解 chat / messages / responses 三种线的一帧 SSE 载荷。
+   *
+   * 工具参数累积一律按 index 分槽：
+   *   ⚠️ 以前用「最后一条」+ 单个 toolArgs 累加器，两个后果：
+   *     ① 首片同时带 name 和部分 arguments 时（OpenAI 兼容网关很常见），
+   *        那段 arguments 被 else 分支整段丢掉 → 模型发来的工具参数损坏；
+   *     ② 并行多个工具调用时参数互相串台。
+   */
   #decodeChatFrame(payload: string, wire: Wire, rename: Record<string, string>, scrub: DsmlScrubber,
-      state: { text: string; reasoning: string; toolArgs: string; tools: ChatResult['toolCalls'] }): void {
+      state: {
+        text: string; reasoning: string; sawTool: boolean; tools: ChatResult['toolCalls'];
+        toolSlots: Map<number, number>; toolArgsByIndex: Map<number, string>;
+      }): void {
+    /** 登记一个新工具调用，返回它在 tools 里的下标 */
+    const openTool = (idx: number, id: string, name: string): number => {
+      const pos = state.tools.push({ id, type: 'function', function: { name, arguments: '' } }) - 1;
+      state.toolSlots.set(idx, pos);
+      state.toolArgsByIndex.set(idx, '');
+      state.sawTool = true;
+      return pos;
+    };
+    /** 追加一段参数增量（核心修复点：绝不丢片） */
+    const appendArgs = (idx: number, frag: unknown): void => {
+      if (frag == null) return;
+      const s = String(frag);
+      if (!s) return;
+      let pos = state.toolSlots.get(idx);
+      if (pos === undefined) {
+        // 流里省略了 index / 首帧只有 arguments：落到最后一条上（老行为）
+        pos = state.tools.length - 1;
+        if (pos < 0) return;
+        state.toolSlots.set(idx, pos);
+      }
+      const acc = (state.toolArgsByIndex.get(idx) ?? '') + s;
+      state.toolArgsByIndex.set(idx, acc);
+      state.tools[pos].function.arguments = acc;
+    };
+
     let frame: any;
     try { frame = JSON.parse(payload); } catch { return; }
 
@@ -295,14 +346,10 @@ export class ZenLane {
       if (delta?.reasoning_content) state.reasoning += String(delta.reasoning_content);
       for (const tc of delta?.tool_calls ?? []) {
         const fn = tc?.function ?? {};
-        if (fn.name) {
-          state.tools.push({ id: tc.id ?? `call_${state.tools.length}`, type: 'function',
-            function: { name: restoreToolName(fn.name, rename), arguments: '' } });
-          state.toolArgs = '';
-        } else if (fn.arguments && state.tools.length) {
-          state.toolArgs += String(fn.arguments);
-          state.tools[state.tools.length - 1].function.arguments = state.toolArgs;
-        }
+        const idx = Number.isInteger(tc?.index) ? Number(tc.index) : (state.tools.length - 1);
+        if (fn.name) openTool(idx, tc.id ?? `call_${state.tools.length}`, restoreToolName(fn.name, rename));
+        // ✅ 无条件追加：以前这行在 else 里，首帧带的那段参数直接被扔了
+        appendArgs(idx, fn.arguments);
       }
       return;
     }
@@ -312,12 +359,9 @@ export class ZenLane {
         if (ev?.type === 'content_block_delta') {
           if (ev.delta?.type === 'text_delta') state.text += scrub.push(String(ev.delta.text ?? ''));
           if (ev.delta?.type === 'thinking_delta') state.reasoning += String(ev.delta.thinking ?? '');
+          if (ev.delta?.type === 'input_json_delta') appendArgs(Number(ev.index ?? -1), ev.delta.partial_json);
         } else if (ev?.type === 'content_block_start' && ev.content_block?.type === 'tool_use') {
-          state.tools.push({ id: ev.content_block.id, type: 'function',
-            function: { name: restoreToolName(String(ev.content_block.name), rename), arguments: '' } });
-        } else if (ev?.type === 'content_block_delta' && ev.delta?.type === 'input_json_delta' && state.tools.length) {
-          const last = state.tools[state.tools.length - 1];
-          last.function.arguments += String(ev.delta.partial_json ?? '');
+          openTool(Number(ev.index ?? -1), String(ev.content_block.id ?? `call_${state.tools.length}`), restoreToolName(String(ev.content_block.name), rename));
         }
       }
       return;

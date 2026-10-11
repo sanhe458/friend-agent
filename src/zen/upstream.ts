@@ -366,7 +366,6 @@ export async function postStreamed(opts: {
   const decoder = new TextDecoder();
   let buf = '';
   let usage: Usage | undefined;
-
   const feed = (payload: string) => {
     opts.onData(payload);
     if (!usage) {
@@ -384,19 +383,46 @@ export async function postStreamed(opts: {
     }
   };
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    // SSE 按行切；不完整就留到下一片
-    let nl: number;
-    while ((nl = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, nl).replace(/\r$/, '');
-      buf = buf.slice(nl + 1);
-      if (line.startsWith('data: ')) feed(line.slice(6));
+  /**
+   * 取一条 SSE 行的 data 载荷。
+   * ⚠️ 以前只认 `data: `（带空格），而 SSE 规范允许 `data:` 不带空格 ——
+   *    遇到那种实现会一片都收不到，上层再报「响应里没有 answers 对象」，
+   *    错得完全对不上现场。这里按规范：前缀 + trim。
+   */
+  const dataOf = (line: string): string | undefined => {
+    if (!line.startsWith('data:')) return undefined;
+    return line.slice(5).trim();
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      // SSE 按行切；不完整就留到下一片
+      let nl: number;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).replace(/\r$/, '');
+        buf = buf.slice(nl + 1);
+        const data = dataOf(line);
+        if (data) feed(data);
+      }
     }
+    // 流尾：把解码器里剩下的半截 UTF-8 冲出来，别把最后一个字符吞了
+    buf += decoder.decode();
+    const tail = dataOf(buf.replace(/\r$/, ''));
+    if (tail) feed(tail);
+  } catch (err) {
+    // 读到一半断了（上游挂了 / 被 abort）：以前这里直接把 TypeError: terminated
+    // 抛出去，lane.chat 判不出类型就不 failover，客户端拿到的错误也和现场无关。
+    if ((err as Error)?.name === 'TimeoutError' || (err as Error)?.name === 'AbortError') {
+      throw new UpstreamError('aborted', 'cancelled');
+    }
+    throw new UpstreamError('transport', (err as Error)?.message ?? String(err));
+  } finally {
+    // 不主动 cancel，socket 要等 GC 才还回去
+    reader.cancel().catch(() => {});
   }
-  if (buf.startsWith('data: ')) feed(buf.slice(6));
   return usage;
 }
 
