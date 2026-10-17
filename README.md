@@ -28,7 +28,7 @@ node src/index.ts --cli    # 起本地 CLI 通道，手动聊天
 | `adapters/` | QQ（WebSocket 网关 + 心跳 ACK 监控 + 45s 就绪超时 + 流式私聊）、Telegram（长轮询 + 429 重试）、CLI/Mock |
 | `store/persist.ts` | SQLite：persons/bindings/memories/history/events/tasks/jobs，**自动修剪** + 绑定先删后插（合并重启不回滚） |
 | `panel/` | Web 控制台（8918）：概览/对话/任务/定时/身份/记忆/通道/模型/**MCP**/角色/人格/日志/搜索/运行时/**设置** |
-| `zen/` | **OpenCode Zen 计划代理网关**（详见 [src/zen/README.md](./src/zen/README.md)）：免费车道 → OpenAI 兼容 `/v1` 接口；会话铸造、指纹门（tools 四元组）、三种线协议、DSML 清洗、429 自动 failover + 限流冷却；**兼容 Jev 型 System One 判定模型**（新模型类型 `kind: "jev"`，`/v1/systemone` 判定专线 + chat 误用双重拦截） |
+| `zen/` | **OpenCode Zen 计划代理网关**（详见 [src/zen/README.md](./src/zen/README.md)，**持续同步上游 [zen-gate-server](https://github.com/sanhe458/zen-gate-server)**）：免费车道 → OpenAI / Anthropic / Responses 兼容 `/v1` 接口；会话铸造、指纹门（tools 四元组）、三种线协议、DSML 清洗、429 自动 failover + 限流账本、纯思考断流 checkpoint 续写、力度=输出预算、工具参数按 index 分槽；**兼容 Jev 型 System One 判定模型**（新模型类型 `kind: "jev"`，`/v1/systemone` 判定专线 + chat 误用双重拦截） |
 | 运维 | systemd 自启动（崩溃自愈实测）+ GitHub 自动推送（path 单元监听） |
 
 ## 已验证的关键行为
@@ -55,7 +55,7 @@ node src/index.ts --cli    # 起本地 CLI 通道，手动聊天
   - 全写路径：记忆增删改查（删除带确认）、改称呼、归并、定时任务新建/编辑/立即跑/停用/删除、模型服务商增删改、MCP 真实 stdio 连接 + 工具列表 + 删除
   - 设置页：面板令牌更换（localStorage 即时跟随、锁不死自己）与清除、秘塔 Key、检索偏好；无 key 搜索优雅降级
   - 手机视口（390×844）：抽屉开合、真实命中测试（elementFromPoint）、抽屉层级、Ctrl+K
-- **加固轮回归自测**（`scripts/hardening-test.ts`，离线，27 项全绿）：把这一轮修掉的坑一条条钉住
+- **加固轮回归自测**（`scripts/hardening-test.ts`，离线，全绿）：把这一轮修掉的坑一条条钉住
   - SSE 解析：`data:` 不带空格也认、末尾无换号的最后一片不丢、流中断归类成 `UpstreamError(transport)` 并释放 reader
   - Zen 工具调用：首片同时带 name+arguments 不丢参数、并行调用不串台（按 index 分槽）
   - rerank 的 `index` 映射回**原始**候选下标（中间夹空文本时以前整片错位 → 召回返回错误的记忆）
@@ -65,6 +65,13 @@ node src/index.ts --cli    # 起本地 CLI 通道，手动聊天
   - `safeEmit`：入站回调抛异常/reject 只记日志，全程 0 个 unhandled rejection
   - MCP 握手失败：杀掉子进程、连接不被标记成 connected（否则永远不再重连），无孤儿进程
   - 记忆分片：`count()` / `forgetPerson()` / 向量入队去重
+- **Zen 网关同步上游**（`scripts/zen-gate-test.ts`，离线 + 本地假上游）：
+  - 指纹门 donor（pwsh）只能用一次；模型点名的 401 判定成「模型不可用」而不是凭据错误
+  - 429 → 换模型接住、`servedBy` 标实际模型、该模型进限流账本；账本冷却到点自动失效、快照深拷贝
+  - 三线解码：Anthropic `message_stop` 不覆盖 `max_tokens`；responses 的 `item.added` 自带参数不丢；参数拼不成 JSON → 降级 `max-tokens`
+  - 纯思考被切断 → 带 checkpoint 续写一次拿到答案；正文写一半被切断 → 直接报错（不把半截答案当完整）
+  - 网关：`/v1/messages`（Anthropic）、`/v1/budget`、`x-zen-gate-served-by`、目录滤掉付费 id
+  - chat 线的 `data: [DONE]` 认作正常收尾（上游常只发它、不给 `finish_reason`；以前整轮被判成断流，工具永远没机会执行）
 
 
 ## 待办

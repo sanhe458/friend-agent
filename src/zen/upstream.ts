@@ -18,17 +18,28 @@ export const FINGERPRINT_TOOLS = ['bash', 'glob', 'grep', 'read'] as const;
 /** 线协议：chat | responses | messages | systemone */
 export type Wire = 'chat' | 'responses' | 'messages' | 'systemone';
 
+/** 三个补槽位真实工具的候选名：没有 bash 时用 pwsh 顶上（上游参考实现的同一约定） */
+export const QUARTET_DONORS: Record<string, string[]> = { bash: ['pwsh'] };
+
 export type FailureCode = 'quota' | 'region' | 'credential' | 'server' | 'transport' | 'aborted';
 
 export class UpstreamError extends Error {
   code: FailureCode;
   retryAfter: number;
   unavailable: boolean;
-  constructor(code: FailureCode, message: string, opts: { retryAfter?: number; unavailable?: boolean } = {}) {
+  /**
+   * 连接层面的失败：请求根本没到上游（拨号被拒 / TLS 握手失败 / 出口把我们切断）。
+   * 与「上游自己把流截断」区分开 —— 后者同样归 transport，但出口是好的。
+   * 上游 zen-gate-server 用这个标记让代理池判断「该换出口了」。
+   */
+  egress: boolean;
+  constructor(code: FailureCode, message: string,
+    opts: { retryAfter?: number; unavailable?: boolean; egress?: boolean } = {}) {
     super(message);
     this.code = code;
     this.retryAfter = opts.retryAfter ?? 0;
     this.unavailable = opts.unavailable ?? false;
+    this.egress = opts.egress ?? false;
   }
 }
 
@@ -194,8 +205,7 @@ function cloneTool(tool: Tool, name: string): Tool {
   return { ...tool, name };
 }
 
-/** 缺槽位时能顶上的真实工具名（pwsh → bash） */
-const QUARTET_DONORS: Record<string, string[]> = { bash: ['pwsh'] };
+/** 缺槽位时能顶上的真实工具名（pwsh → bash），见 QUARTET_DONORS */
 
 /**
  * 满足免费档指纹门：body.tools 必须声明全部四个小写四元组名。
@@ -210,6 +220,8 @@ export function applyFingerprint(body: Record<string, any>, style: 'chat' | 'fla
 
   const seen = new Set<string>();
   const out: Tool[] = [];
+  // donor 只能用一次：一个真实工具顶一个槽位，不能被两次「挪用」成两个槽位
+  const promoted = new Set<string>();
   for (const tool of tools) {
     const current = toolNameOf(tool);
     const lower = current.toLowerCase();
@@ -234,11 +246,14 @@ export function applyFingerprint(body: Record<string, any>, style: 'chat' | 'fla
       if (!orig) return false;
       const lower = orig.toLowerCase();
       // 只允许「非四元组」的真实工具顶上去（已是四元组槽位的不能挪用）
-      return !(FINGERPRINT_TOOLS as readonly string[]).includes(lower) && donors.includes(lower);
+      return !(FINGERPRINT_TOOLS as readonly string[]).includes(lower)
+        && !promoted.has(lower)
+        && donors.includes(lower);
     });
     if (idx >= 0) {
       const tool = out[idx];
       const orig = toolNameOf(tool);
+      promoted.add(orig.toLowerCase());
       rename[name] = orig;
       out[idx] = cloneTool(tool, name);
       seen.add(name);
@@ -324,6 +339,12 @@ function classifyFailure(status: number, payload: string, retryAfterSec: number)
   if (status === 429 || QUOTA_RE.test(payload)) {
     return new UpstreamError('quota', message, { retryAfter: retryAfterSec || 60 });
   }
+  // 载荷自己点名模型不可用/不存在 —— 这是「针对这个模型」的判定，不是凭据问题。
+  // 上游实测会在 401 下也这样回（还有 400/404），所以必须先于状态码判断：
+  // 否则会被下面 401/403 的分支吞掉，健康模型拿到一个假的鉴权错误、也不会 failover。
+  if (status >= 400 && status < 500 && MODEL_ERR_RE.test(payload)) {
+    return new UpstreamError('server', message, { unavailable: true });
+  }
   if (status === 401 || status === 403) return new UpstreamError('credential', message);
   if (status >= 500) return new UpstreamError('server', message);
   if (status === 404 || status === 400 || status === 422 || MODEL_ERR_RE.test(payload)) {
@@ -332,7 +353,71 @@ function classifyFailure(status: number, payload: string, retryAfterSec: number)
   return new UpstreamError('server', message);
 }
 
-export interface Usage { inputTokens: number; outputTokens: number; totalTokens: number }
+/** 用量：各线协议的字段名不同，统一到这里 */
+export interface Usage {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  /** 其中多少是思维链（窗口速度要把思考时间剔出去） */
+  reasoningTokens?: number;
+  cacheReadTokens?: number;
+}
+
+/** 一帧 SSE 载荷里带的用量；没有就是 undefined（字段确实出现了才算有） */
+function usageOf(payload: string): Usage | undefined {
+  let frame: any;
+  try { frame = JSON.parse(payload); } catch { return undefined; }
+  if (!frame || typeof frame !== 'object') return undefined;
+  const pick = (m: any): Usage | undefined => {
+    if (!m || typeof m !== 'object') return undefined;
+    const n = (v: unknown) => (typeof v === 'number' && v >= 0 ? v : 0);
+    const first = (...keys: string[]): number => {
+      for (const k of keys) if (typeof m[k] === 'number' && m[k] >= 0) return m[k] as number;
+      return 0;
+    };
+    const input = first('prompt_tokens', 'input_tokens');
+    const output = first('completion_tokens', 'output_tokens');
+    const total = first('total_tokens');
+    const reasoning = first('reasoning_tokens');
+    const cacheRead = first('cache_read_input_tokens', 'cached_tokens', 'cache_read_tokens');
+    if (!input && !output && !total && !reasoning && !cacheRead) return undefined;
+    return {
+      inputTokens: n(input), outputTokens: n(output),
+      totalTokens: total || input + output,
+      reasoningTokens: reasoning, cacheReadTokens: cacheRead,
+    };
+  };
+  return pick(frame?.usage)
+    ?? pick(frame?.response?.usage)
+    ?? pick(frame?.message?.usage);
+}
+
+function mergeUsage(a: Usage | undefined, b: Usage): Usage {
+  if (!a) return { ...b };
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    totalTokens: a.totalTokens + b.totalTokens,
+    reasoningTokens: (a.reasoningTokens ?? 0) + (b.reasoningTokens ?? 0),
+    cacheReadTokens: (a.cacheReadTokens ?? 0) + (b.cacheReadTokens ?? 0),
+  };
+}
+
+/**
+ * 覆盖式合并：Anthropic 的终结帧 message_delta 报的是**累计**值，
+ * 不能加到 message_start 已经报过的输入上去（否则输入量翻倍）。
+ */
+function overrideUsage(a: Usage, b: Usage): Usage {
+  const input = b.inputTokens || a.inputTokens;
+  const output = b.outputTokens || a.outputTokens;
+  return {
+    inputTokens: input,
+    outputTokens: output,
+    totalTokens: b.totalTokens || input + output,
+    reasoningTokens: b.reasoningTokens || a.reasoningTokens,
+    cacheReadTokens: b.cacheReadTokens || a.cacheReadTokens,
+  };
+}
 
 /**
  * 发一个流式请求，把每条 `data:` 载荷交给 onData。
@@ -354,7 +439,8 @@ export async function postStreamed(opts: {
     signal: opts.signal ?? AbortSignal.timeout(opts.timeoutMs ?? 180_000),
   }).catch((err: Error) => {
     if (err.name === 'TimeoutError' || err.name === 'AbortError') throw new UpstreamError('aborted', 'cancelled');
-    throw new UpstreamError('transport', err.message);
+    // 请求根本没发出去（拨号/握手/出口断了）：出口层面坏了，跟上游无关
+    throw new UpstreamError('transport', err.message, { egress: true });
   });
 
   if (!res.ok) {
@@ -366,21 +452,21 @@ export async function postStreamed(opts: {
   const decoder = new TextDecoder();
   let buf = '';
   let usage: Usage | undefined;
+  // 用量是按帧累积的：Anthropic 的 message_start 报输入、message_delta 报累计输出，
+  // 只取「第一份」会把输出量当 0（以前就是这样）。终结帧用覆盖、其它帧相加。
   const feed = (payload: string) => {
-    opts.onData(payload);
+    try {
+      opts.onData(payload);
+    } catch { /* 上层解码异常不影响继续读流 */ }
+    const u = usageOf(payload);
+    if (!u) return;
     if (!usage) {
-      try {
-        const frame = JSON.parse(payload) as any;
-        const u = frame?.response?.usage ?? frame?.usage ?? frame?.message?.usage;
-        if (u) {
-          usage = {
-            inputTokens: Number(u.input_tokens ?? u.inputTokens ?? u.prompt_tokens ?? 0),
-            outputTokens: Number(u.output_tokens ?? u.outputTokens ?? u.completion_tokens ?? 0),
-            totalTokens: Number(u.total_tokens ?? u.totalTokens ?? 0),
-          };
-        }
-      } catch { /* ignore */ }
+      usage = u;
+      return;
     }
+    let cumulative = false;
+    try { cumulative = JSON.parse(payload)?.type === 'message_delta'; } catch { /* ignore */ }
+    usage = cumulative ? overrideUsage(usage, u) : mergeUsage(usage, u);
   };
 
   /**
@@ -408,7 +494,8 @@ export async function postStreamed(opts: {
         if (data) feed(data);
       }
     }
-    // 流尾：把解码器里剩下的半截 UTF-8 冲出来，别把最后一个字符吞了
+    // 流尾：把解码器里剩下的半截 UTF-8 冲出来，别把最后一个字符吞了。
+    // 最后一行没有换行（流被中途切断）也要处理，否则会丢掉终结帧和用量。
     buf += decoder.decode();
     const tail = dataOf(buf.replace(/\r$/, ''));
     if (tail) feed(tail);

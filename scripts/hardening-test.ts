@@ -90,6 +90,13 @@ console.log('\n▶ A. SSE 解析（data: 无空格 / 流中断归类）');
 console.log('\n▶ B. 工具参数累积（首片带 name+arguments / 并行调用）');
 {
   const lane = new ZenLane();
+  // 工具调用要有对应的 user 回合才谈得上"跑工具"——这条给的是**首轮直接调工具**
+  // （模型不看上下文就开工具），所以得带 tools，否则 gateway 的配对修复会把对不上的
+  // tool_call 当成历史残留。这里只验解码分槽，带不带 tools 不影响，但带上更贴近真实。
+  const tools = [
+    { type: 'function' as const, function: { name: 'bash', description: 'run', parameters: { type: 'object' } } },
+    { type: 'function' as const, function: { name: 'grep', description: 'grep', parameters: { type: 'object' } } },
+  ];
   // 第 1 片同时带 name 和**部分** arguments；第 2、3 片续传
   const frames = [
     'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\\"comm"}}]}}]}\n',
@@ -97,10 +104,11 @@ console.log('\n▶ B. 工具参数累积（首片带 name+arguments / 并行调�
     // 第 2 个工具并行进来，参数不能被第一个吃掉
     'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"grep","arguments":"{\\"q\\":"}}]}}]}\n',
     'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"1}"}}]}}]}\n',
+    // 终结帧是 [DONE]：上游普遍这么收尾，不带 finish_reason 也得认成完整回合
     'data: [DONE]\n',
   ];
   const r = await withStub((async () => sse(frames)) as typeof fetch, () =>
-    lane.chat({ model: 'grok-code', messages: [{ role: 'user', content: '跑一下' }] }));
+    lane.chat({ model: 'grok-code', messages: [{ role: 'user', content: '跑一下' }], tools }));
   const calls = r.toolCalls;
   check('两个工具调用都识别出来', calls.length === 2, `实际 ${calls.length}`);
   check('首片带的那段参数没被丢', calls[0]?.function.arguments === '{"command":"ls"}', calls[0]?.function.arguments ?? '(none)');
